@@ -1,0 +1,14 @@
+# Environment variables
+.env
+
+# Virtual environments
+.venv/
+.venv-old/
+
+# Python caches and test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local archived copies
+archive/

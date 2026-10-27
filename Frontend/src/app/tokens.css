@@ -1,0 +1,116 @@
+/* Hallmark · genre: modern-minimal · macrostructure: n/a (application) · theme: Cobalt · enrichment: none · nav: N3 side-rail (graphite band) · footer: none
+ * tone: technical / instrument panel · anchor hue: 256 (cobalt) · fonts: Space Grotesk + IBM Plex Sans + JetBrains Mono
+ * Hallmark · pre-emit critique: P4 H4 E4 S4 R5 V4
+ */
+
+/* Every colour, font, space, duration and easing used by the dashboard lives here.  */
+/* Components reference these by name; nothing else in the app hard-codes a colour.  */
+/* Colours, fonts and easings sit in Tailwind's @theme so they also become classes   */
+/* (bg-paper, text-muted, border-rule, font-display, ease-out …).                    */
+
+@theme {
+  /* paper = page background, surface = cards/popovers, rules = 1px hairlines */
+  --color-paper: oklch(98.5% 0.004 250);       /* cool engineered near-white (never #fff) */
+  --color-paper-2: oklch(96.4% 0.006 252);     /* hover / alternate row */
+  --color-paper-3: oklch(93.6% 0.009 254);     /* pressed / track backgrounds */
+  --color-surface: oklch(99.4% 0.002 250);     /* cards and popovers sit a notch lighter */
+  --color-rule: oklch(90.5% 0.008 255);        /* hairline borders */
+  --color-rule-2: oklch(63% 0.014 256);        /* input borders (≥ 3:1 against paper, WCAG 1.4.11) */
+
+  /* ink = text */
+  --color-ink: oklch(24% 0.02 258);            /* headings, primary text (never #000) */
+  --color-ink-2: oklch(34% 0.018 257);         /* body text */
+  --color-ink-3: oklch(48% 0.016 257);         /* secondary text, still ≥ 4.5:1 on paper */
+
+  /* the one cobalt signal: active nav, primary button, focus, links */
+  --color-cobalt: oklch(52% 0.19 258);         /* electric cobalt, deep enough for white text */
+  --color-cobalt-ink: oklch(98.5% 0.004 250);  /* text on an accent fill */
+  --color-cobalt-soft: oklch(94.5% 0.03 256);  /* faint accent wash (selected states only) */
+  --color-focus: oklch(55% 0.2 257);           /* focus ring */
+
+  /* graphite = the dark side rail (Cobalt's one dark band) */
+  --color-graphite: oklch(22% 0.016 260);      /* rail background */
+  --color-graphite-2: oklch(27.5% 0.018 260);  /* rail hover / active row */
+  --color-graphite-rule: oklch(32% 0.018 260); /* rail dividers */
+  --color-graphite-ink: oklch(94% 0.008 250);  /* rail text */
+  --color-graphite-muted: oklch(73% 0.014 255);/* rail secondary text */
+  --color-cobalt-bright: oklch(74% 0.14 256);  /* cobalt that reads on the dark rail (icons, focus) */
+
+  /* attendance states (spec §6.5): present = emerald, revoked = amber, danger = red */
+  --color-present: oklch(47% 0.12 158);        /* present text / icon */
+  --color-present-soft: oklch(95.5% 0.04 158); /* present badge fill */
+  --color-present-line: oklch(82% 0.08 158);   /* present badge border */
+  --color-arrival: oklch(90% 0.08 158);        /* new-arrival row flash */
+  --color-revoked: oklch(49% 0.11 62);         /* revoked text / icon */
+  --color-revoked-soft: oklch(95.5% 0.045 85); /* revoked badge fill */
+  --color-revoked-line: oklch(84% 0.09 80);    /* revoked badge border */
+  --color-danger: oklch(53% 0.19 27);          /* destructive actions + errors */
+  --color-danger-soft: oklch(95.5% 0.03 25);   /* destructive hover wash */
+
+  /* fonts (the next/font variables are set on <html> in layout.tsx) */
+  --font-display: var(--font-space-grotesk), ui-sans-serif, sans-serif;   /* headings + big numbers */
+  --font-body: var(--font-plex-sans), ui-sans-serif, sans-serif;          /* everything you read */
+  --font-data: var(--font-jetbrains-mono), ui-monospace, monospace;       /* student numbers, times, labels */
+
+  /* motion easings (Tailwind's ease-* namespace) */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);       /* things arriving */
+  --ease-in: cubic-bezier(0.7, 0, 0.84, 0);        /* things leaving */
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);   /* toggles */
+}
+
+:root {
+  /* 4pt spacing scale (Tailwind's p-1 = 4px matches; these names are for custom CSS) */
+  --space-2xs: 0.25rem;  /* 4px */
+  --space-xs: 0.5rem;    /* 8px */
+  --space-sm: 0.75rem;   /* 12px */
+  --space-md: 1rem;      /* 16px */
+  --space-lg: 1.5rem;    /* 24px */
+  --space-xl: 2.5rem;    /* 40px */
+  --space-2xl: 4rem;     /* 64px */
+
+  /* motion durations */
+  --dur-micro: 120ms;    /* press, colour shift */
+  --dur-short: 200ms;    /* hover, menu */
+  --dur-long: 420ms;     /* dialogs, progress fill */
+  --dur-arrival: 3000ms; /* how long a new arrival stays highlighted (spec §6.4) */
+
+  /* named stacking levels (shadcn overlays — dialogs, sheets, menus — sit at z-50) */
+  --z-sticky: 30;    /* top bar: below every overlay so dialogs dim it */
+  --z-modal: 50;     /* dialogs / sheets (shadcn's level, for custom overlays) */
+  --z-toast: 100;    /* toasts and the skip link: above everything */
+}
+
+.dark {
+  /* dark mode keeps hue 256; only lightness and chroma move (Hallmark colour rule) */
+  --color-paper: oklch(16.5% 0.012 258);
+  --color-paper-2: oklch(20.5% 0.014 258);
+  --color-paper-3: oklch(24.5% 0.016 258);
+  --color-surface: oklch(19% 0.013 258);
+  --color-rule: oklch(29% 0.014 258);
+  --color-rule-2: oklch(53% 0.016 258);
+
+  --color-ink: oklch(95% 0.006 250);
+  --color-ink-2: oklch(87% 0.01 252);
+  --color-ink-3: oklch(71% 0.014 255);
+
+  --color-cobalt: oklch(70% 0.15 256);
+  --color-cobalt-ink: oklch(16.5% 0.012 258);
+  --color-cobalt-soft: oklch(27% 0.06 258);
+  --color-focus: oklch(72% 0.15 256);
+
+  --color-graphite: oklch(12.5% 0.01 260);
+  --color-graphite-2: oklch(20% 0.014 260);
+  --color-graphite-rule: oklch(24% 0.014 260);
+  --color-graphite-ink: oklch(94% 0.008 250);
+  --color-graphite-muted: oklch(71% 0.014 255);
+
+  --color-present: oklch(78% 0.13 158);
+  --color-present-soft: oklch(27% 0.05 158);
+  --color-present-line: oklch(42% 0.08 158);
+  --color-arrival: oklch(36% 0.09 158);
+  --color-revoked: oklch(82% 0.12 80);
+  --color-revoked-soft: oklch(28% 0.05 75);
+  --color-revoked-line: oklch(44% 0.08 75);
+  --color-danger: oklch(71% 0.16 25);
+  --color-danger-soft: oklch(27% 0.06 25);
+}

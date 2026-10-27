@@ -1,0 +1,216 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "./tokens.css"; /* Cobalt design tokens (Hallmark) — the single source of colour, type and motion */
+
+@custom-variant dark (&:is(.dark *));
+
+/* Tailwind theme for shadcn's variable names (the Cobalt tokens themselves are declared in tokens.css) */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-body);
+  --font-mono: var(--font-data);
+  --font-heading: var(--font-display);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/* shadcn's variable names, pointed at the Cobalt tokens (tokens.css swaps them for dark mode) */
+:root {
+  --background: var(--color-paper);
+  --foreground: var(--color-ink-2);
+  --card: var(--color-surface);
+  --card-foreground: var(--color-ink-2);
+  --popover: var(--color-surface);
+  --popover-foreground: var(--color-ink-2);
+  --primary: var(--color-cobalt);
+  --primary-foreground: var(--color-cobalt-ink);
+  --secondary: var(--color-paper-2);
+  --secondary-foreground: var(--color-ink);
+  --muted: var(--color-paper-2);
+  --muted-foreground: var(--color-ink-3);
+  --accent: var(--color-paper-2);
+  --accent-foreground: var(--color-ink);
+  --destructive: var(--color-danger);
+  --border: var(--color-rule);
+  --input: var(--color-rule-2);
+  --ring: var(--color-focus);
+  --chart-1: var(--color-cobalt);
+  --chart-2: var(--color-present);
+  --chart-3: var(--color-revoked);
+  --chart-4: var(--color-ink-3);
+  --chart-5: var(--color-ink);
+  --radius: 0.4rem; /* Cobalt: tight "drawn with a ruler" radii (≈6px buttons, ≈9px cards) */
+  --sidebar: var(--color-graphite);
+  --sidebar-foreground: var(--color-graphite-ink);
+  --sidebar-primary: var(--color-cobalt);
+  --sidebar-primary-foreground: var(--color-cobalt-ink);
+  --sidebar-accent: var(--color-graphite-2);
+  --sidebar-accent-foreground: var(--color-graphite-ink);
+  --sidebar-border: var(--color-graphite-rule);
+  --sidebar-ring: var(--color-focus);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+}
+
+/* ---- Hallmark base rules ---------------------------------------------- */
+
+html,
+body {
+  overflow-x: clip; /* never a sideways page scroll (clip keeps sticky headers working) */
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-display); /* Space Grotesk for every heading */
+  color: var(--color-ink); /* headings use the darkest ink */
+  font-style: normal; /* headings are always roman */
+  letter-spacing: -0.02em; /* tight tracking on display sizes */
+  overflow-wrap: anywhere; /* long course names wrap instead of overflowing */
+  min-width: 0; /* allows wrapping inside flex/grid rows */
+}
+
+::selection {
+  background: var(--color-cobalt-soft); /* the accent's one text flood */
+  color: var(--color-ink);
+}
+
+/* shadcn primitives ship `transition-all`; restrict them to cheap properties so focus rings appear instantly */
+[data-slot="button"],
+[data-slot="badge"],
+[data-slot="tabs-trigger"],
+[data-slot="switch"],
+[data-slot="checkbox"] {
+  transition-property: color, background-color, border-color, opacity, transform;
+  transition-duration: var(--dur-micro);
+  transition-timing-function: var(--ease-out);
+}
+
+[data-slot="progress-indicator"] {
+  transition-property: transform; /* the fill slides; nothing else animates */
+  transition-duration: var(--dur-long);
+  transition-timing-function: var(--ease-out);
+}
+
+/* tall dialogs on short screens: stay inside the viewport and scroll instead of clipping the title and buttons */
+[data-slot="dialog-content"],
+[data-slot="alert-dialog-content"] {
+  max-height: calc(100dvh - 2rem); /* same 1rem margin the width already keeps */
+  overflow-y: auto; /* scroll inside the dialog */
+}
+
+/* numbers line up in tables and stat cards */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* the "Live" dot: a functional status signal, so it loops — but never under reduced motion */
+@keyframes live-ping {
+  0% {
+    transform: scale(1);
+    opacity: 0.7;
+  }
+  80%,
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+.live-ping {
+  animation: live-ping 1.6s var(--ease-out) infinite;
+}
+
+/* a row that just turned present fades from the arrival colour back to normal */
+@keyframes arrival-fade {
+  from {
+    background-color: var(--color-arrival);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+.arrival {
+  animation: arrival-fade var(--dur-arrival) var(--ease-in-out) forwards;
+}
+
+/* inside forms, buttons match the 44px inputs (Hallmark: input height = button height) */
+form [data-slot="button"]:not([data-size^="icon"]):not([data-size="sm"]):not([data-size="xs"]) {
+  min-height: 2.75rem;
+}
+
+/* touch screens: every button is at least a 44px target */
+@media (pointer: coarse) {
+  [data-slot="button"],
+  [data-slot="select-trigger"],
+  [data-slot="tabs-trigger"] {
+    min-height: 2.75rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* all motion (incl. shadcn's dialog/sheet/menu zoom and slide) collapses to a short fade */
+  *,
+  *::before,
+  *::after {
+    animation-duration: 150ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 150ms !important;
+    scroll-behavior: auto !important;
+  }
+  .live-ping {
+    animation: none; /* static dot, the "Live" label still says it */
+  }
+  .arrival {
+    animation: none; /* no fade; the row keeps a static highlight instead */
+    background-color: var(--color-arrival);
+  }
+  [data-slot="progress-indicator"] {
+    transition-duration: 0ms;
+  }
+}
