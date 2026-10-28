@@ -1,0 +1,4 @@
+   # Netlify settings for the Next.js dashboard (lives inside Frontend/)
+   [build]
+     command = "npm run build"   # builds the Next.js app
+     publish = ".next"           # where Next.js puts the built app
