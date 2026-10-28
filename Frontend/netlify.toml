@@ -1,4 +1,10 @@
-   # Netlify settings for the Next.js dashboard (lives inside Frontend/)
-   [build]
-     command = "npm run build"   # builds the Next.js app
-     publish = ".next"           # where Next.js puts the built app
+# Netlify settings for the Next.js dashboard (lives inside Frontend/)
+[build]
+  command = "npm run build"   # builds the Next.js app
+  publish = ".next"           # where Next.js puts the built app
+
+[build.environment]
+  NEXT_PUBLIC_API_URL = "https://biometric-api-fogc.onrender.com"   # the live backend on Render (no / at the end)
+  NEXT_PUBLIC_APP_NAME = "Biometric Attendance"                      # name shown in the dashboard
+  NEXT_PUBLIC_TIMEZONE = "Africa/Johannesburg"                       # show times in SA time
+  NODE_VERSION = "22"                                                # Node version for the build
