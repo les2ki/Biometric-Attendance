@@ -1,0 +1,33 @@
+services:
+  - type: web                      # a website/API that runs all the time
+    name: biometric-api            # name shown in Render
+    runtime: python                # it's a Python app
+    plan: free                     # free tier
+    region: ohio                   # same region as the Neon database
+    rootDir: Backend               # run everything inside the Backend folder
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m alembic upgrade head && python -m scripts.seed && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health       # Render checks this to know the API is alive
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.14
+      - key: database_url
+        sync: false                # Render will ask you to paste the Neon link
+      - key: JWT_secret_key
+        generateValue: true        # Render creates a random secret for you
+      - key: cors_origins
+        value: http://localhost:3000
+      - key: hmac_max_skew_seconds
+        value: "300"
+      - key: jwt_expire_minutes
+        value: "30"
+      - key: fp_accept_confidence
+        value: "50"
+      - key: fp_slot_capacity
+        value: "127"
+      - key: command_ttl_minutes
+        value: "10"
+      - key: device_online_seconds
+        value: "30"
+      - key: display_timezone
+        value: Africa/Johannesburg
