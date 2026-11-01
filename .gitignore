@@ -12,3 +12,5 @@ __pycache__/
 
 # Local archived copies
 archive/
+
+terminal/secrets.h
