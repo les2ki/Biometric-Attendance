@@ -11,7 +11,6 @@ from app.schemas.admin import CommandOut, ConsentUpdate, CourseBrief, EnrolIn, S
 from app.schemas.common import Page  # paged list
 from app.services.audit import write_audit  # audit trail
 from app.services.commands import OPEN_STATUSES, delete_student_biometrics, queue_enrol  # command queue
-from app.services.face import delete_face  # face templates go with the fingerprints
 from app.services.views import command_outs, student_out, student_outs  # response builders
 
 router = APIRouter(prefix="/admin/students", tags=["admin"])  # every route here starts with /admin/students
@@ -83,7 +82,6 @@ def update_student(student_id: int, payload: StudentUpdate, admin: AdminUser, db
         student.is_active = payload.is_active  # apply
     if deactivating:  # inactive students keep no biometrics
         delete_student_biometrics(db, student=student, device_id=None, admin=admin)  # wipe every sensor
-        delete_face(db, student=student, actor=admin, reason="deactivated")  # and the face templates
     write_audit(db, actor=admin, action="student.updated", entity="students", entity_id=student.id, details={"before": before, "after": _snapshot(student)})  # audit
     db.commit()  # all changes + audit together
     return student_out(db, student)  # response
@@ -100,7 +98,6 @@ def set_consent(student_id: int, payload: ConsentUpdate, admin: AdminUser, db: D
         student.biometric_consent = False  # no more biometrics
         student.consent_at = None  # clear the timestamp
         delete_student_biometrics(db, student=student, device_id=None, admin=admin)  # unlink + wipe every sensor
-        delete_face(db, student=student, actor=admin, reason="consent_withdrawn")  # and the face templates
         write_audit(db, actor=admin, action="consent.withdrawn", entity="students", entity_id=student.id)  # audit
     db.commit()  # all changes + audit together
     return student_out(db, student)  # response

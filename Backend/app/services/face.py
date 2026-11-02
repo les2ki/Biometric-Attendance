@@ -6,7 +6,7 @@ from pathlib import Path  # model file paths
 
 import numpy as np  # picture bytes -> array
 from fastapi import HTTPException, status  # validation errors
-from sqlalchemy import select  # query builder
+from sqlalchemy import func, select  # query builder
 from sqlalchemy.exc import IntegrityError  # duplicate attendance race
 from sqlalchemy.orm import Session  # DB session type
 
@@ -32,6 +32,17 @@ _recognizer = None  # cv2.FaceRecognizerSF, created once
 
 def _now() -> datetime:  # one place for "now"
     return datetime.now(timezone.utc)  # always timezone-aware UTC
+
+
+def face_counts(db: Session, student_ids: list[int]) -> dict[int, int]:  # count enrolled face templates per student
+    if not student_ids:  # avoid an empty IN clause
+        return {}
+    rows = db.execute(
+        select(FaceTemplate.student_id, func.count())
+        .where(FaceTemplate.student_id.in_(student_ids))
+        .group_by(FaceTemplate.student_id)
+    ).tuples().all()
+    return dict(rows)
 
 
 def download_models() -> None:  # fetch any missing model file (build step, start-up thread, or first use)
