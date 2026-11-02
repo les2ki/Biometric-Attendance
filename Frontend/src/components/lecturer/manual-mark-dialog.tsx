@@ -15,7 +15,8 @@ import { errorMessage } from "@/lib/errors"; // friendly text
 
 export const QUICK_REASONS = [ // one-tap reasons (spec §6.4)
   "No biometric consent, ID verified", // POPIA fallback
-  "Fingerprint not recognised, ID verified", // sensor didn't match
+  "Fingerprint not recognised, ID verified", // sensor didn’t match
+  "Face not verified, ID checked", // face check failed at the terminal
   "Arrived after terminal issue", // terminal was down
   "Correction", // fixing a mistake
 ];

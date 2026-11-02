@@ -35,7 +35,7 @@ export interface ChangePasswordIn { current_password: string; new_password: stri
 
 // ---- Admin (Phase 2) — copied from Backend/app/schemas/admin.py ----
 
-export type CommandType = "enrol" | "delete_slot"; // what a terminal is asked to do
+export type CommandType = "enrol" | "delete_slot" | "face_enrol" | "face_verify"; // what a terminal is asked to do (face types: FACE)
 export type CommandStatus = "pending" | "in_progress" | "done" | "failed" | "cancelled" | "expired"; // command life cycle
 
 export interface UserCreate { email: string; full_name: string; role: Role; password: string; } // POST /admin/users

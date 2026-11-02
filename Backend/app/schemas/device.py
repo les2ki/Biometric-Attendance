@@ -25,7 +25,7 @@ class AttendanceOut(BaseModel):  # decision the terminal turns into LCD/LED/buzz
 
 class DeviceCommandOut(BaseModel):  # next job for the terminal (enrol a finger / wipe a slot)
     command_id: int  # echoed back in the result call
-    type: Literal["enrol", "delete_slot"]  # what to do
+    type: Literal["enrol", "delete_slot", "face_enrol", "face_verify"]  # what to do (face types: FACE)
     slot_number: int  # sensor slot to fill or wipe
     student_number: str | None  # LCD info for enrol (None for wipes)
     full_name: str | None  # LCD shows "Enrol: <name>"

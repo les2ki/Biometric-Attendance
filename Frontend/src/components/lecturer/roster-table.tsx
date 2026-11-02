@@ -1,7 +1,7 @@
 "use client"; // tabs, search and highlight state
 
 import { useMemo, useState } from "react"; // React
-import { ArrowDownWideNarrow, Search, Undo2, UserCheck, UserX } from "lucide-react"; // icons
+import { ArrowDownWideNarrow, ScanFace, Search, Undo2, UserCheck, UserX } from "lucide-react"; // icons
 import { Button } from "@/components/ui/button"; // row actions
 import { Input } from "@/components/ui/input"; // search box
 import { Skeleton } from "@/components/ui/skeleton"; // loading rows
@@ -28,11 +28,12 @@ interface RosterTableProps { // inputs from the live page
   onQueryChange: (query: string) => void; // update ?q=
   onMark: (entry: RosterEntry) => void; // "Mark present" / "Reinstate"
   onRevoke: (entry: RosterEntry) => void; // "Revoke"
+  onFaceVerify?: (entry: RosterEntry) => void; // "Verify by face" (only while the session is open)
 }
 
 interface ArrivalTracker { key: number; present: Set<number>; fresh: Set<number>; } // previous poll vs this poll
 
-export function RosterTable({ entries, dataUpdatedAt, loading, tab, query, onTabChange, onQueryChange, onMark, onRevoke }: RosterTableProps) { // the live class list (spec §6.4)
+export function RosterTable({ entries, dataUpdatedAt, loading, tab, query, onTabChange, onQueryChange, onMark, onRevoke, onFaceVerify }: RosterTableProps) { // the live class list (spec §6.4)
   const [sortByTime, setSortByTime] = useState(false); // optional: newest arrivals first
   const [tracker, setTracker] = useState<ArrivalTracker | null>(null); // who was present at the previous poll
 
@@ -82,7 +83,7 @@ export function RosterTable({ entries, dataUpdatedAt, loading, tab, query, onTab
 
       {/* the table (scrolls sideways inside its border on phones) */}
       <div className="overflow-x-auto rounded-lg border border-rule bg-surface">
-        <Table className="min-w-[56rem] text-[0.95rem]">
+        <Table className="min-w-[60rem] text-[0.95rem]">
           <TableCaption className="sr-only">Class list for this session with attendance status</TableCaption>
           {/* headings */}
           <TableHeader>
@@ -147,10 +148,20 @@ export function RosterTable({ entries, dataUpdatedAt, loading, tab, query, onTab
                     </Tooltip>
                   ) : e.method === "fingerprint" && e.fp_confidence !== null ? (
                     <span className="tabular font-mono text-xs text-muted-foreground">score {e.fp_confidence}</span>
+                  ) : e.method === "face" && e.face_score !== null ? (
+                    <span className="tabular font-mono text-xs text-muted-foreground">similarity {e.face_score.toFixed(2)}</span>
                   ) : null}
                 </TableCell>
                 {/* one action per state */}
-                <TableCell className="text-right">
+                <TableCell className="text-right whitespace-nowrap">
+                  {onFaceVerify && e.status !== "present" && (e.face_enrolled ? (
+                    <Button variant="ghost" size="sm" className="mr-1" aria-label={`Verify ${e.full_name} by face`} onClick={() => onFaceVerify(e)}><ScanFace className="size-3.5" aria-hidden /><span className="hidden 2xl:inline">Verify by face</span><span className="2xl:hidden">Face</span></Button>
+                  ) : (
+                    <Tooltip>
+                      <TooltipTrigger asChild><span tabIndex={0} className="mr-1 inline-block rounded-md focus-visible:outline-2 focus-visible:outline-ring"><Button variant="ghost" size="sm" disabled aria-label={`Verify ${e.full_name} by face (no face enrolled)`}><ScanFace className="size-3.5" aria-hidden /><span className="hidden 2xl:inline">Verify by face</span><span className="2xl:hidden">Face</span></Button></span></TooltipTrigger>
+                      <TooltipContent>No face enrolled</TooltipContent>
+                    </Tooltip>
+                  ))}
                   {e.status === "absent" && <Button variant="outline" size="sm" onClick={() => onMark(e)}><UserCheck className="size-3.5" aria-hidden />Mark present</Button>}
                   {e.status === "present" && <Button variant="ghost" size="sm" className="text-danger hover:bg-danger-soft hover:text-danger" onClick={() => onRevoke(e)}><UserX className="size-3.5" aria-hidden />Revoke</Button>}
                   {e.status === "revoked" && <Button variant="outline" size="sm" onClick={() => onMark(e)}><Undo2 className="size-3.5" aria-hidden />Reinstate</Button>}

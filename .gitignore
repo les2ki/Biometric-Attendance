@@ -14,3 +14,6 @@ __pycache__/
 archive/
 
 terminal/secrets.h
+
+# Face models (downloaded by python -m scripts.get_face_models)
+Backend/models/

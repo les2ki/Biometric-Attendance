@@ -7,10 +7,12 @@ from sqlalchemy.exc import IntegrityError  # unique-constraint clashes
 from sqlalchemy.orm import Session  # DB session type
 
 from app.config import settings  # fp_slot_capacity, command_ttl_minutes
-from app.models import CommandStatus, CommandType, Device, DeviceCommand, FingerprintSlot, Student, User  # tables used here
+from app.models import CommandStatus, CommandType, Device, DeviceCommand, FaceTemplate, FingerprintSlot, Student, User  # tables used here (FaceTemplate: FACE)
 from app.services.audit import write_audit  # audit trail
 
 OPEN_STATUSES = (CommandStatus.pending, CommandStatus.in_progress)  # commands that still hold a slot
+CAPTURE_TYPES = (CommandType.enrol, CommandType.face_enrol, CommandType.face_verify)  # FACE: commands that capture a biometric (need consent)
+FACE_TYPES = (CommandType.face_enrol, CommandType.face_verify)  # FACE: face picture commands
 MAX_SKIPS = 10  # max commands cancelled in one /next call before giving up
 
 
@@ -128,6 +130,12 @@ def delete_student_biometrics(db: Session, *, student: Student, device_id: int |
         wipe = _cancel(db, cmd, "biometrics_deleted", now)  # stop them
         if wipe is not None:  # it had been claimed, so a wipe was queued too
             wipes.append(wipe)  # include it in the response
+    face_rows = db.execute(delete(FaceTemplate).where(FaceTemplate.student_id == student.id)).rowcount if device_id is None else 0  # FACE: POPIA - the face template goes too (all-terminal deletions only)
+    if device_id is None:  # FACE: stop any face pictures still waiting for this student
+        for cmd in db.scalars(select(DeviceCommand).where(DeviceCommand.student_id == student.id, DeviceCommand.type.in_(FACE_TYPES), DeviceCommand.status.in_(OPEN_STATUSES))).all():  # FACE: open face commands
+            _cancel(db, cmd, "biometrics_deleted", now)  # FACE: cancel (no sensor wipe needed for faces)
+    if face_rows:  # FACE: something was deleted
+        write_audit(db, actor=admin, action="face.deleted", entity="students", entity_id=student.id, details={})  # FACE: audit
     db.flush()  # make sure everything has IDs
     write_audit(db, actor=admin, action="fingerprint.deleted", entity="students", entity_id=student.id, details={"device_id": device_id, "slots": removed})  # audit
     return wipes  # caller commits
@@ -165,14 +173,14 @@ def next_command(db: Session, device: Device) -> NextCommand | None:  # terminal
         if cmd is None:  # nothing to do
             return None  # router sends 204
         student = db.get(Student, cmd.student_id) if cmd.student_id is not None else None  # who it's for
-        if cmd.type == CommandType.enrol and (student is None or not student.is_active or not student.biometric_consent):  # consent gone since queueing
+        if cmd.type in CAPTURE_TYPES and (student is None or not student.is_active or not student.biometric_consent):  # consent gone since queueing (FACE: face commands too)
             _cancel(db, cmd, "consent_withdrawn", now)  # don't capture a finger without consent
             db.commit()  # save and look again
             continue  # next command
         if cmd.status == CommandStatus.pending:  # first time the terminal sees it
             cmd.status = CommandStatus.in_progress  # claimed
             cmd.claimed_at = now  # when
-            if cmd.type == CommandType.enrol:  # the student needs time at the terminal
+            if cmd.type in CAPTURE_TYPES:  # the student needs time at the terminal (FACE: face commands too)
                 cmd.expires_at = now + timedelta(minutes=settings.command_ttl_minutes)  # fresh deadline from now
         db.commit()  # save the claim
         return NextCommand(cmd, student)  # hand it to the terminal
@@ -204,6 +212,12 @@ def report_result(db: Session, *, device: Device, command_id: int, success: bool
         write_audit(db, actor=actor, action="fingerprint.slot_wiped", entity="device_commands", entity_id=cmd.id, details={"device_id": device.id, "slot": cmd.slot_number, "student_id": cmd.student_id})  # audit
         db.commit()  # save
         return cmd  # done
+    if cmd.type in FACE_TYPES:  # FACE: the template/attendance was already handled by /face; just close the command
+        cmd.status = CommandStatus.done  # FACE: success
+        cmd.result_detail = detail  # FACE: e.g. face_enrolled / face_verified
+        cmd.completed_at = now  # FACE: finished
+        db.commit()  # FACE: save
+        return cmd  # FACE: done
     student = db.get(Student, cmd.student_id) if cmd.student_id is not None else None  # enrolled student
     if student is None or not student.is_active or not student.biometric_consent:  # consent withdrawn during capture
         cmd.status = CommandStatus.cancelled  # don't keep it

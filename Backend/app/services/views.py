@@ -9,6 +9,7 @@ from app.models import Attendance, Course, CourseLecturer, CourseStudent, Device
 from app.schemas.admin import CommandOut, CourseOut, DeviceOut, StudentOut  # admin shapes
 from app.schemas.lecturer import SessionCounts, SessionOut  # lecturer shapes
 from app.services.commands import OPEN_STATUSES  # pending + in_progress
+from app.services.face import face_counts  # face templates per student
 
 
 def is_online(device: Device) -> bool:  # seen within the threshold?
@@ -23,7 +24,8 @@ def student_outs(db: Session, students: list[Student]) -> list[StudentOut]:  # s
     if ids:  # skip the query for an empty list
         for student_id, device_id in db.execute(select(FingerprintSlot.student_id, FingerprintSlot.device_id).where(FingerprintSlot.student_id.in_(ids)).order_by(FingerprintSlot.device_id)):  # all slots for these students
             devices[student_id].append(device_id)  # group by student
-    return [StudentOut(id=s.id, student_number=s.student_number, full_name=s.full_name, is_active=s.is_active, biometric_consent=s.biometric_consent, consent_at=s.consent_at, enrolled_device_ids=devices[s.id]) for s in students]  # build responses
+    faces = face_counts(db, ids)  # student_id -> face templates (one grouped query)
+    return [StudentOut(id=s.id, student_number=s.student_number, full_name=s.full_name, is_active=s.is_active, biometric_consent=s.biometric_consent, consent_at=s.consent_at, enrolled_device_ids=devices[s.id], face_samples=faces.get(s.id, 0)) for s in students]  # build responses
 
 
 def student_out(db: Session, student: Student) -> StudentOut:  # single-student convenience
@@ -33,7 +35,7 @@ def student_out(db: Session, student: Student) -> StudentOut:  # single-student 
 def command_outs(db: Session, commands: list[DeviceCommand]) -> list[CommandOut]:  # commands with student numbers (one query)
     ids = {c.student_id for c in commands if c.student_id is not None}  # students referenced
     numbers = dict(db.execute(select(Student.id, Student.student_number).where(Student.id.in_(ids))).tuples().all()) if ids else {}  # id -> number
-    return [CommandOut(id=c.id, device_id=c.device_id, type=c.type, status=c.status, slot_number=c.slot_number, student_id=c.student_id, student_number=numbers.get(c.student_id), created_at=c.created_at, expires_at=c.expires_at, completed_at=c.completed_at, result_detail=c.result_detail) for c in commands]  # build responses
+    return [CommandOut(id=c.id, device_id=c.device_id, type=c.type, status=c.status, slot_number=c.slot_number, student_id=c.student_id, student_number=numbers.get(c.student_id), created_at=c.created_at, expires_at=c.expires_at, completed_at=c.completed_at, result_detail=c.result_detail, session_id=c.session_id, frames_received=c.frames_received or 0, face_score=c.face_score) for c in commands]  # build responses
 
 
 def course_outs(db: Session, courses: list[Course]) -> list[CourseOut]:  # courses with lecturer/student counts

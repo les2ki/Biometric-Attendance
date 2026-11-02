@@ -16,6 +16,7 @@ import { ConsentBadge } from "@/components/admin/consent-badge"; // consent pill
 import { EditStudentDialog } from "@/components/admin/edit-student-dialog"; // rename
 import { countdown, EnrolDialog } from "@/components/admin/enrol-dialog"; // guided enrolment
 import { RecordConsentDialog } from "@/components/admin/record-consent-dialog"; // grant consent
+import { FaceCard } from "@/components/face/face-card"; // FACE: enrol / verify face
 import { ConfirmDialog } from "@/components/confirm-dialog"; // destructive confirms
 import { EmptyState } from "@/components/empty-state"; // not found
 import { PageHeader } from "@/components/page-header"; // title row
@@ -163,6 +164,9 @@ function StudentView({ studentId }: { studentId: number }) { // split out so hoo
               </div>
             )}
           </Card>
+
+          {/* FACE: face card */}
+          <FaceCard student={s} />
 
           {/* Card 3 — terminal activity */}
           <Card title="Terminal activity">

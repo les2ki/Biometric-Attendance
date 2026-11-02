@@ -50,6 +50,7 @@ class StudentOut(BaseModel):  # a student in lists
     biometric_consent: bool  # POPIA consent flag
     consent_at: datetime | None  # when consent was given
     enrolled_device_ids: list[int]  # terminals holding this student's fingerprint
+    face_samples: int = 0  # stored face templates (0 = no face enrolled)
 
 
 class CourseBrief(BaseModel):  # short course reference inside a student detail
@@ -67,15 +68,18 @@ class SlotOut(BaseModel):  # one fingerprint slot mapping
 class CommandOut(BaseModel):  # a queued terminal command as the dashboard sees it
     id: int  # command ID
     device_id: int  # target terminal
-    type: CommandType  # enrol / delete_slot
+    type: CommandType  # enrol / delete_slot / face_enrol / face_verify
     status: CommandStatus  # life cycle state
-    slot_number: int  # sensor slot
+    slot_number: int | None  # sensor slot (None for face jobs)
     student_id: int | None  # student being enrolled (None after deletion)
     student_number: str | None  # convenience for the UI
     created_at: datetime  # queued at
     expires_at: datetime | None  # deadline (None = never)
     completed_at: datetime | None  # when it finished
-    result_detail: str | None  # error text or cancel reason
+    result_detail: str | None  # error text or cancel reason (face jobs: outcome code, e.g. matched / not_matched / no_face)
+    session_id: int | None = None  # face_verify from a lecturer: session being marked
+    frames_received: int = 0  # face jobs: pictures uploaded so far
+    face_score: float | None = None  # face_verify: best cosine similarity
 
 
 class StudentDetail(StudentOut):  # GET /admin/students/{id}
@@ -158,3 +162,22 @@ class AuditOut(BaseModel):  # one audit log row
     entity: str  # table affected
     entity_id: str  # row affected
     details: dict[str, Any]  # before/after values
+
+
+class FaceStatus(BaseModel):  # GET /admin/students/{id}/face
+    enrolled: bool  # at least one finished template
+    samples: int  # templates stored
+    model_version: str  # model that made them
+    enrolled_at: datetime | None  # newest template
+
+
+class FaceDeviceIn(BaseModel):  # POST /admin/students/{id}/face/enrol and /face/check
+    device_id: int  # terminal whose camera takes the pictures
+
+
+class FaceCommandOut(CommandOut):  # GET /face/commands/{id}: polled by the dashboard while the terminal works
+    student_name: str | None  # who is in front of the camera
+    threshold: float  # current match threshold (for the honest "score / threshold" line)
+    shots: int  # good pictures the job needs
+    samples_captured: int  # good pictures so far (enrol progress dots)
+    preview_available: bool  # the last picture can still be fetched (memory only, expires)

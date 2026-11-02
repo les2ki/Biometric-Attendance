@@ -51,7 +51,7 @@ function History({ deviceId }: { deviceId: number }) { // split out so hooks run
   const columns: Column<CommandOut>[] = [ // spec §7.2 columns
     { key: "type", header: "Type", cell: (c) => <CommandTypeLabel type={c.type} /> }, // enrol / wipe
     { key: "student", header: "Student", cell: (c) => (c.student_id ? <Link href={`/admin/students/${c.student_id}`} className="tabular rounded font-mono text-sm text-cobalt hover:underline focus-visible:outline-2 focus-visible:outline-ring">{c.student_number}</Link> : <span className="text-sm text-muted-foreground">—</span>) }, // link to the student
-    { key: "slot", header: "Slot", cell: (c) => <span className="tabular font-mono text-sm">#{c.slot_number}</span> }, // sensor slot
+    { key: "slot", header: "Slot", cell: (c) => c.slot_number === null ? <span className="text-sm text-muted-foreground">—</span> : <span className="tabular font-mono text-sm">#{c.slot_number}</span> }, // sensor slot (face jobs have none)
     { key: "status", header: "Status", cell: (c) => <CommandStatusBadge status={c.status} /> }, // state
     { key: "queued", header: "Queued", cell: (c) => <span className="tabular font-mono text-xs whitespace-nowrap text-ink-2">{fmtDateTime(c.created_at)}</span> }, // when queued
     { key: "completed", header: "Completed", cell: (c) => <span className="tabular font-mono text-xs whitespace-nowrap text-ink-2">{c.completed_at ? fmtDateTime(c.completed_at) : "—"}</span> }, // when finished

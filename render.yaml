@@ -5,7 +5,7 @@ services:
     plan: free                     # free tier
     region: ohio                   # same region as the Neon database
     rootDir: Backend               # run everything inside the Backend folder
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && python -m scripts.get_face_models   # FACE: also download the face models
     startCommand: python -m alembic upgrade head && python -m scripts.seed && uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health       # Render checks this to know the API is alive
     envVars:
@@ -31,3 +31,5 @@ services:
         value: "30"
       - key: display_timezone
         value: Africa/Johannesburg
+      - key: face_match_threshold   # FACE: similarity needed to accept a face (raise to be stricter)
+        value: "0.363"

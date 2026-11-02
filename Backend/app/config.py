@@ -28,6 +28,15 @@ class Settings:
         self.command_ttl_minutes = int(os.getenv("command_ttl_minutes", "10"))  # how long an enrol command stays valid
         self.device_online_seconds = int(os.getenv("device_online_seconds", "30"))  # last_seen within this = "online"
         self.display_timezone = os.getenv("display_timezone", "Africa/Johannesburg")  # timezone used in CSV exports
+        self.face_key = os.getenv("face_key", "")  # Fernet key for face templates; empty = derived from JWT_secret_key
+        self.face_match_threshold = float(os.getenv("face_match_threshold", "0.363"))  # min cosine similarity accepted as "same person" (SFace default; tune from measurements)
+        self.face_enrol_shots = int(os.getenv("face_enrol_shots", "3"))  # pictures stored per enrolment
+        self.face_max_frames = int(os.getenv("face_max_frames", "6"))  # pictures a face command may upload before it fails
+        self.face_max_failed_attempts = int(os.getenv("face_max_failed_attempts", "3"))  # failed face checks per student per session, then manual only
+        self.face_command_ttl_seconds = int(os.getenv("face_command_ttl_seconds", "120"))  # how long a face command stays valid
+        self.face_min_face_px = int(os.getenv("face_min_face_px", "40"))  # smallest face width accepted (pixels in the 320x240 picture)
+        self.face_preview_seconds = int(os.getenv("face_preview_seconds", "120"))  # how long the dashboard can see the last picture (memory only)
+        self.face_model_dir = os.getenv("face_model_dir", str(Path(__file__).resolve().parent.parent / "models"))  # where the ONNX files live
         
 
     # Database settings
@@ -49,6 +58,17 @@ class Settings:
     command_ttl_minutes: int = 10  # enrol command lifetime
     device_online_seconds: int = 30  # online threshold for the dashboard
     display_timezone: str = "Africa/Johannesburg"  # CSV export timezone
+
+    #face settings
+    face_key: str  # Fernet key (empty = derived from JWT_secret_key)
+    face_match_threshold: float = 0.363  # cosine similarity threshold
+    face_enrol_shots: int = 3  # pictures per enrolment
+    face_max_frames: int = 6  # upload limit per face command
+    face_max_failed_attempts: int = 3  # per student per session
+    face_command_ttl_seconds: int = 120  # face command lifetime
+    face_min_face_px: int = 40  # smallest usable face
+    face_preview_seconds: int = 120  # dashboard preview lifetime (memory only)
+    face_model_dir: str  # ONNX model folder
 
 
 settings = Settings()

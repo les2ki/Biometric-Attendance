@@ -13,12 +13,23 @@ DEVICE_ID = int(os.environ["DEVICE_ID"])  # from seed output
 DEVICE_SECRET = os.environ["DEVICE_SECRET"]  # from seed output
 
 
-def send(method: str, path: str, payload: dict | None = None) -> None:  # sign and send one request, like the ESP32 will
-    body = json.dumps(payload).encode() if payload is not None else b""  # raw bytes that get signed
+def picture_packet(image_path: str) -> bytes:  # any picture -> the camera ESP's packet (320x240 greyscale), like the main ESP32 forwards it
+    import struct  # little-endian header
+    import cv2  # read + resize the picture (opencv-python-headless is in requirements.txt)
+    grey = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)  # load as greyscale
+    if grey is None:  # unreadable file
+        raise SystemExit(f"can't read {image_path}")  # stop
+    grey = cv2.resize(grey, (320, 240))  # same size as the OV7670 QVGA picture
+    pixels = grey.tobytes()  # one byte per pixel
+    return b"FRM1" + struct.pack("<HHI", 320, 240, len(pixels)) + pixels + struct.pack("<H", sum(pixels) & 0xFFFF)  # header + pixels + checksum
+
+
+def send(method: str, path: str, payload: dict | None = None, raw: bytes | None = None) -> None:  # sign and send one request, like the ESP32 will
+    body = raw if raw is not None else (json.dumps(payload).encode() if payload is not None else b"")  # raw bytes that get signed
     timestamp = int(time.time())  # send time
     nonce = secrets.token_hex(16)  # 32 random hex chars, fresh every request
     signature = compute_signature(DEVICE_SECRET, method, path, timestamp, nonce, body)  # HMAC over method/path/ts/nonce/body
-    headers = {"X-Device-Id": str(DEVICE_ID), "X-Timestamp": str(timestamp), "X-Nonce": nonce, "X-Signature": signature, "Content-Type": "application/json"}  # the 4 auth headers + JSON type
+    headers = {"X-Device-Id": str(DEVICE_ID), "X-Timestamp": str(timestamp), "X-Nonce": nonce, "X-Signature": signature, "Content-Type": "application/octet-stream" if raw is not None else "application/json"}  # the 4 auth headers + body type
     response = httpx.request(method, API_URL + path, content=body, headers=headers)  # send the exact signed bytes
     print(response.status_code, response.text or ("no commands" if response.status_code == 204 else ""))  # show the server's answer (204 = nothing queued)
 
@@ -36,8 +47,10 @@ def main() -> None:  # tiny command-line interface
     elif args[:1] == ["result"] and len(args) >= 3 and args[2] in ("ok", "fail"):  # ... result <command_id> ok|fail [detail]
         detail = " ".join(args[3:]) or None  # optional error text
         send("POST", f"/device/commands/{int(args[1])}/result", {"success": args[2] == "ok", "detail": detail})  # report the outcome
+    elif args[:1] == ["frame"] and len(args) == 3:  # ... frame <command_id> <picture.png>   (face jobs: upload one picture)
+        send("POST", f"/device/commands/{int(args[1])}/frame", raw=picture_packet(args[2]))  # same bytes the camera ESP sends
     else:  # wrong usage
-        print("usage: session | next | result <command_id> ok|fail [detail] | mark <session_id> <slot> <confidence> [key]")  # help text
+        print("usage: session | next | result <command_id> ok|fail [detail] | mark <session_id> <slot> <confidence> [key] | frame <command_id> <picture.png>")  # help text
 
 
 if __name__ == "__main__":  # only when run directly

@@ -1,131 +1,162 @@
-// fingerprint_test.ino - Stage 1 bench test for the DY50 (DY50-2 v1) fingerprint sensor on an ESP32
-// Biometric Student Attendance terminal. Wiring: see docs/hardware/fingerprint-wiring.png
-// Serial Monitor: 115200 baud, line ending "Newline". Type a command and press Enter:
-//   i        sensor info (capacity, security level, stored templates)
-//   s        scan once: place a finger, prints slot + confidence (1:N search)
-//   a        toggle auto-scan mode (scans continuously, like the real terminal will)
-//   e<slot>  enrol a finger into a slot, e.g. e1
-//   d<slot>  delete one slot, e.g. d1
-//   x        delete ALL slots (asks for confirmation)
+// camera_fix.ino - last attempt: find WHY the OV7670 frames are 20% short and try to fix it automatically
+// Board package 2.0.17. Same wiring as camera_test. Serial Monitor 115200. Takes about 3-4 minutes.
+// Phase A: print the camera's window/clock registers (so we know how the driver set it up)
+// Phase B: count how many lines each frame really has (120 expected at 160x120)
+// Phase C: slow the camera's pixel clock (if the ESP32 is missing bytes because they come too fast)
+// Phase D: make the picture window taller (if lines are missing)
+// Phase E: make the picture window wider (if pixels per line are missing)
+// At the end it prints a RESULTS table. Send that to Claude.
 
-#include <Adafruit_Fingerprint.h>  // driver for DY50 / FPM10A / R307 / AS608 sensors (same protocol) (Library Manager: "Adafruit Fingerprint Sensor Library")
+#include "esp_camera.h"  // camera driver
+#include <Wire.h>        // I2C, to read/write camera registers ourselves (worked 50/50 in camera_diag)
 
-const int FP_RX_PIN = 16;  // ESP32 GPIO16 = UART2 RX, wired to the sensor's TX
-const int FP_TX_PIN = 17;  // ESP32 GPIO17 = UART2 TX, wired to the sensor's RX
-const uint32_t FP_BAUD = 57600;  // factory default baud rate of these sensors
-const uint16_t FINGER_TIMEOUT_MS = 10000;  // how long we wait for a finger before giving up
+const int CAM_PIN_D0 = 4, CAM_PIN_D1 = 5, CAM_PIN_D2 = 18, CAM_PIN_D3 = 19;    // data bits 0-3
+const int CAM_PIN_D4 = 36, CAM_PIN_D5 = 39, CAM_PIN_D6 = 34, CAM_PIN_D7 = 35;  // data bits 4-7
+const int CAM_PIN_VSYNC = 25, CAM_PIN_HREF = 23, CAM_PIN_PCLK = 22;           // VS, HS, PLK
+const int CAM_PIN_XCLK = 21, CAM_PIN_SDA = 26, CAM_PIN_SCL = 27;              // XLK, SDA, SCL
+const uint8_t ADDR = 0x21;                   // OV7670 bus address
 
-HardwareSerial fingerSerial(2);  // use the ESP32's hardware UART number 2
-Adafruit_Fingerprint finger(&fingerSerial);  // sensor object that talks over UART2
+// OV7670 register numbers (from the OV7670 datasheet)
+const uint8_t REG_VREF = 0x03, REG_CLKRC = 0x11, REG_COM7 = 0x12, REG_HSTART = 0x17, REG_HSTOP = 0x18;  // window + clock
+const uint8_t REG_VSTRT = 0x19, REG_VSTOP = 0x1A, REG_HREF = 0x32, REG_COM14 = 0x3E, REG_DBLV = 0x6B;    // window + PLL
+const uint8_t REG_COM3 = 0x0C, REG_SCALE_DCW = 0x72, REG_SCALE_PCLK = 0x73;                             // scaling
 
-bool autoScan = false;  // true = keep scanning in loop() without typing 's'
+String results = "";                         // the final table
 
-void printHelp() {  // list the available commands
-  Serial.println("Commands: i=info  s=scan  a=auto-scan on/off  e<slot>=enrol  d<slot>=delete  x=delete all");  // one-line help
+void startXclk() {  // our own 10 MHz camera clock
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(CAM_PIN_XCLK, 10000000, 1);     // core 3.x API
+  ledcWrite(CAM_PIN_XCLK, 1);                // 50% duty
+#else
+  ledcSetup(0, 10000000, 1);                 // core 2.x: channel 0, 10 MHz, 1-bit
+  ledcAttachPin(CAM_PIN_XCLK, 0);            // to the XLK pin
+  ledcWrite(0, 1);                           // 50% duty = square wave
+#endif
+  delay(50);                                 // let the camera wake up
 }
 
-bool waitForFinger(uint16_t timeoutMs) {  // wait until a finger image is captured, or time out
-  unsigned long start = millis();  // remember when we started waiting
-  while (millis() - start < timeoutMs) {  // keep trying until the timeout
-    uint8_t r = finger.getImage();  // ask the sensor to take a picture
-    if (r == FINGERPRINT_OK) return true;  // got an image
-    if (r != FINGERPRINT_NOFINGER) Serial.println("  imaging error, keep finger still");  // something other than "no finger yet"
-    delay(50);  // short pause between attempts
+uint8_t rd(uint8_t reg) {  // read one camera register (write address, STOP, then read - the way the OV7670 likes)
+  Wire.beginTransmission(ADDR);              // talk to the camera
+  Wire.write(reg);                           // which register
+  Wire.endTransmission(true);                // full STOP
+  Wire.requestFrom(ADDR, (uint8_t)1);        // ask for one byte
+  return Wire.available() ? Wire.read() : 0xFF;  // the value (0xFF if nothing came back)
+}
+
+void wr(uint8_t reg, uint8_t val) {  // write one camera register
+  Wire.beginTransmission(ADDR);              // talk to the camera
+  Wire.write(reg);                           // which register
+  Wire.write(val);                           // new value
+  Wire.endTransmission(true);                // send it
+  delay(5);                                  // give the camera a moment
+}
+
+bool startCam() {  // starts the driver at 160x120 RGB565, sharing the Wire bus so we can also use Wire
+  camera_config_t c = {};                    // zero everything
+  c.pin_d0 = CAM_PIN_D0; c.pin_d1 = CAM_PIN_D1; c.pin_d2 = CAM_PIN_D2; c.pin_d3 = CAM_PIN_D3;  // data 0-3
+  c.pin_d4 = CAM_PIN_D4; c.pin_d5 = CAM_PIN_D5; c.pin_d6 = CAM_PIN_D6; c.pin_d7 = CAM_PIN_D7;  // data 4-7
+  c.pin_vsync = CAM_PIN_VSYNC; c.pin_href = CAM_PIN_HREF; c.pin_pclk = CAM_PIN_PCLK;           // sync + clock in
+  c.pin_xclk = -1;                           // XCLK is ours
+  c.pin_pwdn = -1; c.pin_reset = -1;         // hard-wired
+  c.xclk_freq_hz = 10000000;                 // what XCLK is
+  c.ledc_timer = LEDC_TIMER_3; c.ledc_channel = LEDC_CHANNEL_7;  // spare (unused)
+  c.pixel_format = PIXFORMAT_RGB565;         // colour
+  c.frame_size = FRAMESIZE_QQVGA;            // 160 x 120
+  c.fb_count = 1; c.fb_location = CAMERA_FB_IN_DRAM; c.grab_mode = CAMERA_GRAB_WHEN_EMPTY;  // one buffer in RAM
+  c.pin_sccb_sda = -1; c.pin_sccb_scl = -1; c.sccb_i2c_port = 0;  // method A: share the Wire bus
+  if (esp_camera_init(&c) == ESP_OK) return true;  // worked
+  esp_camera_deinit();                       // clean up
+  c.pin_sccb_sda = CAM_PIN_SDA; c.pin_sccb_scl = CAM_PIN_SCL;  // method B: driver opens its own bus
+  bool ok = esp_camera_init(&c) == ESP_OK;   // try again
+  Wire.end();                                // the driver took the pins for its own bus...
+  Wire.begin(CAM_PIN_SDA, CAM_PIN_SCL, 100000);  // ...so take them back for our own register reads/writes
+  return ok;                                 // result
+}
+
+int grab(int tries) {  // tries to capture complete frames; returns how many were complete (38400 bytes)
+  int ok = 0;                                // complete frames
+  for (int i = 0; i < tries; i++) {          // each attempt
+    camera_fb_t *fb = esp_camera_fb_get();   // NULL if the frame was the wrong size
+    if (fb) { if (fb->len == 38400) ok++; esp_camera_fb_return(fb); }  // count + give back
   }
-  return false;  // nobody placed a finger in time
+  return ok;                                 // how many worked
 }
 
-void waitForRemoval() {  // wait until the finger is lifted off the glass
-  while (finger.getImage() != FINGERPRINT_NOFINGER) delay(50);  // keep checking until the glass is empty
+void note(const String &s) {  // prints a line now AND saves it for the final table
+  Serial.println(s);                         // now
+  results += s + "\n";                       // later
 }
 
-void showInfo() {  // print the sensor's parameters
-  finger.getParameters();  // read capacity, security level, etc. from the sensor
-  finger.getTemplateCount();  // count stored fingerprints
-  Serial.print("Capacity: "); Serial.println(finger.capacity);  // maximum templates the sensor can hold
-  Serial.print("Security level: "); Serial.println(finger.security_level);  // 1 (loose) .. 5 (strict); design targets level 3
-  Serial.print("Stored templates: "); Serial.println(finger.templateCount);  // how many slots are in use
-}
+volatile uint32_t hrefCount = 0, framesSeen = 0, linesLastFrame = 0;  // counters updated by interrupts
+void IRAM_ATTR onHref() { hrefCount++; }     // one more line started
+void IRAM_ATTR onVsync() { linesLastFrame = hrefCount; hrefCount = 0; framesSeen++; }  // a new frame: save the line count
 
-bool scanOnce(uint16_t timeoutMs, bool quiet) {  // capture a finger and search all stored templates (1:N)
-  if (!quiet) Serial.println("Place finger on the sensor...");  // prompt
-  if (!waitForFinger(timeoutMs)) {  // nothing placed in time
-    if (!quiet) Serial.println("  no finger detected");  // tell the user
-    return false;  // give up
+void setup() {
+  Serial.begin(115200);                      // serial monitor
+  delay(800);                                // let it connect
+  Serial.println("\n=== OV7670 frame fixer (wait ~3-4 min, ignore red E (...) lines) ===");  // banner
+  startXclk();                               // camera clock on
+  Wire.begin(CAM_PIN_SDA, CAM_PIN_SCL, 100000);  // our I2C bus
+  if (!startCam()) { Serial.println("Driver did not start. Stop here and tell Claude."); return; }  // safety
+
+  // ---- Phase A: how did the driver set the camera up? ----
+  uint8_t vref = rd(REG_VREF), hstart = rd(REG_HSTART), hstop = rd(REG_HSTOP), href = rd(REG_HREF);  // window regs
+  uint8_t vstrt = rd(REG_VSTRT), vstop = rd(REG_VSTOP), clkrc = rd(REG_CLKRC), dblv = rd(REG_DBLV);  // window + clock
+  note("A) COM7=" + String(rd(REG_COM7), HEX) + " COM3=" + String(rd(REG_COM3), HEX) + " COM14=" + String(rd(REG_COM14), HEX) +
+       " DCW=" + String(rd(REG_SCALE_DCW), HEX) + " PCLKDIV=" + String(rd(REG_SCALE_PCLK), HEX));  // scaling setup
+  note("   HSTART=" + String(hstart, HEX) + " HSTOP=" + String(hstop, HEX) + " HREF=" + String(href, HEX) +
+       " VSTRT=" + String(vstrt, HEX) + " VSTOP=" + String(vstop, HEX) + " VREF=" + String(vref, HEX) +
+       " CLKRC=" + String(clkrc, HEX) + " DBLV=" + String(dblv, HEX));  // window + clock
+
+  // ---- Phase B: count real lines per frame (driver paused so we can watch VS/HS ourselves) ----
+  esp_camera_deinit();                       // stop the driver; the camera keeps running on our XCLK
+  Wire.end();                                // restart our bus cleanly...
+  Wire.begin(CAM_PIN_SDA, CAM_PIN_SCL, 100000);  // ...so the pins are definitely ours
+  attachInterrupt(CAM_PIN_HREF, onHref, RISING);    // count line starts
+  attachInterrupt(CAM_PIN_VSYNC, onVsync, RISING);  // count frames
+  delay(1500);                               // watch for 1.5 s
+  detachInterrupt(CAM_PIN_HREF);             // stop counting
+  detachInterrupt(CAM_PIN_VSYNC);            // stop counting
+  unsigned long hi = pulseIn(CAM_PIN_HREF, HIGH, 100000);  // how long one line lasts (microseconds)
+  note("B) frames/1.5s=" + String(framesSeen) + "  lines/frame=" + String(linesLastFrame) + " (expect 120)  line time=" + String(hi) + " us");  // result
+
+  // ---- Phase C: slower pixel clock ----
+  const uint8_t divs[] = {1, 2, 3, 5, 7};    // divide the camera's internal clock by 2, 3, 4, 6, 8
+  for (uint8_t d : divs) {                   // try each
+    if (!startCam()) break;                  // restart driver (it rewrites all registers)
+    wr(REG_DBLV, 0x0A);                      // PLL off (no clock multiplying)
+    wr(REG_CLKRC, d);                        // divide the clock
+    delay(300);                              // let a few frames pass at the new speed
+    int ok = grab(3);                        // try to capture
+    note("C) clock /" + String(d + 1) + " : " + String(ok) + "/3 complete" + (ok ? "  <-- WORKS" : ""));  // result
+    esp_camera_deinit();                     // stop for the next try
   }
-  if (finger.image2Tz(1) != FINGERPRINT_OK) {  // convert the image to features in buffer 1
-    Serial.println("  unclear image, try again (press firmly, finger dry and clean)");  // usual cause of failure
-    waitForRemoval();  // wait for the finger to lift
-    return false;  // try again next time
+
+  // ---- Phase D: taller window (more lines) ----
+  const int addV[] = {6, 12, 18, 24, 30};    // how much to move VSTOP down
+  for (int a : addV) {                       // try each
+    if (!startCam()) break;                  // fresh driver setup
+    wr(REG_VSTOP, (uint8_t)min(255, vstop + a));  // end the picture later = more lines
+    delay(300);                              // let a frame pass
+    int ok = grab(2);                        // try to capture
+    note("D) VSTOP+" + String(a) + " : " + String(ok) + "/2 complete" + (ok ? "  <-- WORKS" : ""));  // result
+    esp_camera_deinit();                     // stop for the next try
   }
-  uint8_t r = finger.fingerSearch();  // compare buffer 1 against every stored template
-  if (r == FINGERPRINT_OK) {  // a match was found
-    Serial.print("  MATCH  slot="); Serial.print(finger.fingerID);  // which slot matched (the backend maps slot -> student)
-    Serial.print("  confidence="); Serial.println(finger.confidence);  // match score (backend threshold: fp_accept_confidence)
-  } else if (r == FINGERPRINT_NOTFOUND) {  // valid print but not enrolled
-    Serial.println("  NO MATCH (finger not enrolled)");  // terminal would show "Not recognised"
-  } else {  // communication problem
-    Serial.println("  search error (check wiring)");  // usually a loose wire
+
+  // ---- Phase E: wider window (more pixels per line) ----
+  const int addH[] = {4, 8, 12, 16};         // how much to move HSTOP right (units of 8 sensor pixels)
+  for (int a : addH) {                       // try each
+    if (!startCam()) break;                  // fresh driver setup
+    wr(REG_HSTOP, (uint8_t)((hstop + a) & 0xFF));  // end each line later = more pixels
+    delay(300);                              // let a frame pass
+    int ok = grab(2);                        // try to capture
+    note("E) HSTOP+" + String(a) + " : " + String(ok) + "/2 complete" + (ok ? "  <-- WORKS" : ""));  // result
+    esp_camera_deinit();                     // stop for the next try
   }
-  waitForRemoval();  // don't scan the same touch twice
-  return r == FINGERPRINT_OK;  // true only on a match
+
+  Serial.println("\n========== RESULTS ==========");  // header
+  Serial.print(results);                     // everything noted above
+  Serial.println("=============================\nSend this whole table to Claude.");  // footer
 }
 
-bool enrol(uint16_t slot) {  // capture the same finger twice and store it in a slot
-  Serial.print("Enrolling into slot "); Serial.println(slot);  // confirm the target slot
-  Serial.println("Place finger...");  // first capture
-  if (!waitForFinger(FINGER_TIMEOUT_MS)) { Serial.println("  timed out"); return false; }  // no finger
-  if (finger.image2Tz(1) != FINGERPRINT_OK) { Serial.println("  unclear image, start again"); return false; }  // bad first image
-  Serial.println("  OK. Remove finger.");  // ask the user to lift
-  delay(500);  // small pause so the user reacts
-  waitForRemoval();  // wait until lifted
-  Serial.println("Place the SAME finger again...");  // second capture
-  if (!waitForFinger(FINGER_TIMEOUT_MS)) { Serial.println("  timed out"); return false; }  // no finger
-  if (finger.image2Tz(2) != FINGERPRINT_OK) { Serial.println("  unclear image, start again"); return false; }  // bad second image
-  uint8_t r = finger.createModel();  // combine both captures into one template
-  if (r == FINGERPRINT_ENROLLMISMATCH) { Serial.println("  the two captures didn't match, start again"); return false; }  // different finger or poor placement
-  if (r != FINGERPRINT_OK) { Serial.println("  could not create template"); return false; }  // other error
-  r = finger.storeModel(slot);  // save the template in the sensor's flash at this slot
-  if (r != FINGERPRINT_OK) { Serial.println("  could not store (slot out of range?)"); return false; }  // e.g. slot > capacity
-  Serial.println("  STORED. Enrolment complete.");  // success
-  waitForRemoval();  // tidy up
-  return true;  // done
-}
-
-void setup() {  // runs once at power-up
-  Serial.begin(115200);  // USB serial monitor
-  delay(500);  // give the monitor time to attach
-  fingerSerial.begin(FP_BAUD, SERIAL_8N1, FP_RX_PIN, FP_TX_PIN);  // start UART2 on our chosen pins
-  delay(100);  // let the sensor settle
-  if (finger.verifyPassword()) {  // handshake using the default password (0x00000000)
-    Serial.println("DY50 found.");  // wiring and power are good
-  } else {  // no reply
-    Serial.println("DY50 NOT found. Check: VCC on VIN (5V), GND, sensor TX->GPIO16, sensor RX->GPIO17 (try swapping TX/RX).");  // most common fixes
-    while (true) delay(1000);  // stop here until reset
-  }
-  showInfo();  // print capacity and current templates
-  printHelp();  // show the command list
-}
-
-void loop() {  // runs forever
-  if (Serial.available()) {  // a command was typed
-    String line = Serial.readStringUntil('\n');  // read the whole line
-    line.trim();  // remove spaces and \r
-    if (line.length() == 0) return;  // ignore empty lines
-    char cmd = line.charAt(0);  // first character = command
-    int arg = line.substring(1).toInt();  // the rest = number (slot), 0 if none
-    if (cmd == 'i') showInfo();  // info
-    else if (cmd == 's') scanOnce(FINGER_TIMEOUT_MS, false);  // single scan
-    else if (cmd == 'a') { autoScan = !autoScan; Serial.println(autoScan ? "Auto-scan ON" : "Auto-scan OFF"); }  // toggle auto mode
-    else if (cmd == 'e' && arg >= 1) enrol(arg);  // enrol into slot arg
-    else if (cmd == 'd' && arg >= 1) Serial.println(finger.deleteModel(arg) == FINGERPRINT_OK ? "Deleted." : "Delete failed.");  // delete one slot
-    else if (cmd == 'x') {  // wipe everything
-      Serial.println("Type YES to delete all templates:");  // safety prompt
-      while (!Serial.available()) delay(10);  // wait for the answer
-      String confirm = Serial.readStringUntil('\n'); confirm.trim();  // read it
-      Serial.println(confirm == "YES" && finger.emptyDatabase() == FINGERPRINT_OK ? "All templates deleted." : "Cancelled.");  // only on exact YES
-    }
-    else printHelp();  // unknown command
-  }
-  if (autoScan) scanOnce(200, true);  // in auto mode, look for a finger briefly each loop (quiet when nobody touches)
-}
+void loop() {}  // nothing to repeat

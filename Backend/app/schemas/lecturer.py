@@ -52,6 +52,8 @@ class RosterEntry(BaseModel):  # one roster student in one session
     recorded_at: datetime | None  # server time of the record
     device_time: datetime | None  # terminal clock time
     fp_confidence: int | None  # match score
+    face_score: float | None = None  # face match similarity (method = face)
+    face_enrolled: bool = False  # the student has a face on file (enables "Verify by face")
     note: str | None  # reason for a manual entry
     revoked_at: datetime | None  # when it was revoked
     revoke_reason: str | None  # why
@@ -66,6 +68,10 @@ class RosterView(BaseModel):  # GET /lecturer/sessions/{id}/attendance
 class ManualMark(BaseModel):  # POST /lecturer/sessions/{id}/manual
     student_number: str = Field(min_length=1, max_length=20)  # who to mark present
     reason: str = Field(min_length=3, max_length=255)  # why (mandatory, audited)
+
+
+class FaceVerifyIn(BaseModel):  # POST /lecturer/sessions/{id}/face-verify
+    student_number: str = Field(min_length=1, max_length=20)  # who the student says they are
 
 
 class RevokeIn(BaseModel):  # POST /lecturer/attendance/{id}/revoke

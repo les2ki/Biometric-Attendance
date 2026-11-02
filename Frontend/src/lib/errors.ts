@@ -41,6 +41,9 @@ const MESSAGES: Record<string, string> = { // backend error code → sentence a 
   unknown_command: "Command not found.", // cancel command
   command_not_active: "That command has already finished.", // cancel finished command
   wipe_cannot_be_cancelled: "Fingerprint deletions can’t be cancelled (POPIA).", // wipe guard
+  face_not_enrolled: "Enrol this student’s face before verifying it.", // FACE: nothing to compare with
+  face_pending: "A face picture for this student is already waiting on that terminal.", // FACE: queued twice
+  face_models_missing: "The server’s face models aren’t ready yet. Try again in a minute.", // FACE: first start-up
 };
 
 export function errorMessage(err: unknown): string { // friendly sentence for any thrown error

@@ -13,6 +13,7 @@ import { CloseSessionDialog } from "@/components/lecturer/close-session-dialog";
 import { ExportButton } from "@/components/lecturer/export-button"; // CSV
 import { ManualMarkDialog, type MarkTarget } from "@/components/lecturer/manual-mark-dialog"; // mark / reinstate
 import { RevokeDialog } from "@/components/lecturer/revoke-dialog"; // revoke
+import { FaceVerifyPanel } from "@/components/face/face-verify-panel"; // FACE: verify by face
 import { ROSTER_TABS, RosterTable, type RosterTab } from "@/components/lecturer/roster-table"; // the class list
 import { useRoster, useSession } from "@/hooks/use-lecturer"; // data
 import { useNow } from "@/hooks/use-now"; // "Updated 2 s ago" ticker
@@ -138,6 +139,8 @@ function LiveSession({ sessionId }: { sessionId: number }) { // split out so hoo
       {/* roster */}
       <section aria-labelledby="roster-heading" className="space-y-3">
         <h2 id="roster-heading" className="text-lg font-semibold">Class list</h2>
+        {/* FACE: verify an absent student by face (open sessions only) */}
+        {session?.is_open && entries && <FaceVerifyPanel sessionId={sessionId} entries={entries} />}
         {/* error with retry (only when nothing has loaded yet) */}
         {roster.isError && !entries && (
           <div role="alert" className="flex flex-wrap items-center gap-3 rounded-lg border border-danger/40 bg-danger-soft px-4 py-3 text-sm text-danger">

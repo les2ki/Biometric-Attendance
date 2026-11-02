@@ -1,0 +1,847 @@
+diff --git a/Backend/.gitignore b/Backend/.gitignore
+new file mode 100644
+index 0000000..c7e6403
+--- /dev/null
++++ b/Backend/.gitignore
+@@ -0,0 +1,3 @@
++
++# Face models (downloaded by scripts/get_face_models.py)
++models/
+diff --git a/Backend/app/main.py b/Backend/app/main.py
+index cabafc5..ee078ba 100644
+--- a/Backend/app/main.py
++++ b/Backend/app/main.py
+@@ -11,6 +11,7 @@ admin_courses = import_module(".routers.admin_courses", package=__package__)  #
+ admin_devices = import_module(".routers.admin_devices", package=__package__)  # /admin/devices + /admin/commands
+ admin_audit = import_module(".routers.admin_audit", package=__package__)  # /admin/audit (read-only)
+ lecturer = import_module(".routers.lecturer", package=__package__)  # /lecturer
++face = import_module(".routers.face", package=__package__)  # FACE: face enrol/verify (dashboard + terminal upload)
+ config = import_module(".config", package=__package__)  # settings.cors_origins
+ 
+ 
+@@ -39,3 +40,4 @@ app.include_router(admin_courses.router)  # tag: admin
+ app.include_router(admin_devices.router)  # tag: admin
+ app.include_router(admin_audit.router)  # tag: admin
+ app.include_router(lecturer.router)  # tag: lecturer
++app.include_router(face.router)  # FACE: tags admin, lecturer, device
+diff --git a/Backend/app/models.py b/Backend/app/models.py
+index 5cfabda..f03a25e 100644
+--- a/Backend/app/models.py
++++ b/Backend/app/models.py
+@@ -1,7 +1,7 @@
+ import enum  # built-in enum support
+ from datetime import datetime  # type for timestamp columns
+ 
+-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, JSON, String, UniqueConstraint, func, true  # column types/constraints
++from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, JSON, LargeBinary, String, UniqueConstraint, func, true  # column types/constraints (LargeBinary: FACE)
+ from sqlalchemy.orm import Mapped, mapped_column, relationship  # typed column declarations
+ 
+ from app.db import Base  # shared base with naming convention
+@@ -113,6 +113,8 @@ class AuditLog(Base):  # append-only history: enrolments, deletions, overrides,
+ class CommandType(str, enum.Enum):  # what the terminal is asked to do
+     enrol = "enrol"  # capture a finger into slot_number for student_id
+     delete_slot = "delete_slot"  # wipe slot_number from the sensor (POPIA deletion)
++    face_enrol = "face_enrol"  # FACE: take a picture and store the student's face template
++    face_verify = "face_verify"  # FACE: take a picture and compare it with the stored template
+ 
+ 
+ class CommandStatus(str, enum.Enum):  # life cycle of a terminal command
+@@ -161,3 +163,12 @@ class DeviceCommand(Base):  # work queued for a terminal (enrol a finger / wipe
+     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # when the terminal picked it up
+     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # when it finished (done/failed/cancelled/expired)
+     result_detail: Mapped[str | None] = mapped_column(String(255))  # terminal error text or cancel reason
++    session_id: Mapped[int | None] = mapped_column(ForeignKey("sessions.id", ondelete="SET NULL"))  # FACE: session to mark present after a lecturer's face verify
++
++
++class FaceTemplate(Base):  # FACE: one face template (128 numbers from SFace) per student; the picture itself is never stored
++    __tablename__ = "face_templates"  # table name
++    id: Mapped[int] = mapped_column(primary_key=True)  # primary key
++    student_id: Mapped[int] = mapped_column(ForeignKey("students.id", ondelete="CASCADE"), unique=True)  # one template per student; deleted with the student
++    embedding: Mapped[bytes] = mapped_column(LargeBinary)  # 128 float32 values = 512 bytes
++    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())  # when enrolled
+diff --git a/Backend/app/routers/device.py b/Backend/app/routers/device.py
+index d277ac8..75ede76 100644
+--- a/Backend/app/routers/device.py
++++ b/Backend/app/routers/device.py
+@@ -81,8 +81,8 @@ def next_device_command(device: CurrentDevice, db: DbSession) -> DeviceCommandOu
+         command_id=cmd.id,  # echoed back in the result
+         type=cmd.type.value,  # enrol / delete_slot
+         slot_number=cmd.slot_number,  # sensor slot
+-        student_number=student.student_number if student and cmd.type == CommandType.enrol else None,  # LCD info for enrol only
+-        full_name=student.full_name if student and cmd.type == CommandType.enrol else None,  # LCD info for enrol only
++        student_number=student.student_number if student and cmd.type != CommandType.delete_slot else None,  # LCD info for enrol and face commands (FACE)
++        full_name=student.full_name if student and cmd.type != CommandType.delete_slot else None,  # LCD info for enrol and face commands (FACE)
+         expires_at=cmd.expires_at,  # deadline (None for wipes)
+     )
+ 
+diff --git a/Backend/app/routers/face.py b/Backend/app/routers/face.py
+new file mode 100644
+index 0000000..823bf0c
+--- /dev/null
++++ b/Backend/app/routers/face.py
+@@ -0,0 +1,92 @@
++import threading  # load the face models in the background at start-up
++
++from fastapi import APIRouter, HTTPException, Request, status  # routing + raw body + errors
++from pydantic import BaseModel, Field  # request/response shapes
++from sqlalchemy import delete, select  # queries
++
++from app.auth import AdminUser, StaffUser  # admins; lecturers (and admins)
++from app.models import CommandType, CourseStudent, Device, FaceTemplate, Student  # tables used here
++from app.routers.common import DbSession  # per-request DB session
++from app.schemas.admin import CommandOut  # queued command as the dashboard sees it
++from app.security import CurrentDevice  # HMAC-authenticated terminal
++from app.services import face as face_service  # analysis + queueing
++from app.services.access import get_session_for_user  # lecturer can only use their own sessions
++from app.services.audit import write_audit  # audit trail
++
++router = APIRouter()  # paths below carry their own prefixes
++threading.Thread(target=face_service.preload, daemon=True).start()  # download/load models now so the first picture is quick
++
++
++class FaceDeviceIn(BaseModel):  # admin: which terminal takes the picture
++    device_id: int  # terminal id
++
++
++class FaceVerifyIn(BaseModel):  # lecturer: which student to verify
++    student_number: str = Field(min_length=1, max_length=20, pattern=r"^[0-9]+$")  # e.g. 220000001
++
++
++class FaceStatusOut(BaseModel):  # GET face status for the student page
++    enrolled: bool  # a template exists
++    enrolled_at: str | None  # when (ISO)
++
++
++class FaceResultOut(BaseModel):  # reply to the terminal's picture upload
++    status: str  # ok / no_face / multiple_faces / poor_quality / no_match / face_not_enrolled
++    full_name: str  # for the LCD
++    score: float | None  # verify similarity (tuning)
++    attendance: str | None  # lecturer verify: recorded / already_present / not_in_course / revoked
++
++
++def _command_out(db, cmd) -> CommandOut:  # same shape the existing command lists use
++    student = db.get(Student, cmd.student_id) if cmd.student_id is not None else None  # for the number
++    return CommandOut(id=cmd.id, device_id=cmd.device_id, type=cmd.type, status=cmd.status, slot_number=cmd.slot_number, student_id=cmd.student_id, student_number=student.student_number if student else None, created_at=cmd.created_at, expires_at=cmd.expires_at, completed_at=cmd.completed_at, result_detail=cmd.result_detail)  # build
++
++
++@router.get("/admin/students/{student_id}/face", response_model=FaceStatusOut, tags=["admin"])  # is a face enrolled?
++def face_status(student_id: int, user: AdminUser, db: DbSession) -> FaceStatusOut:  # admin only
++    row = db.scalars(select(FaceTemplate).where(FaceTemplate.student_id == student_id)).first()  # template?
++    return FaceStatusOut(enrolled=row is not None, enrolled_at=row.created_at.isoformat() if row else None)  # answer
++
++
++@router.post("/admin/students/{student_id}/face/enrol", response_model=CommandOut, status_code=status.HTTP_201_CREATED, tags=["admin"])  # admin: enrol a face on a terminal
++def face_enrol(student_id: int, payload: FaceDeviceIn, user: AdminUser, db: DbSession) -> CommandOut:  # admin only
++    cmd = face_service.queue_face(db, kind=CommandType.face_enrol, student=db.get(Student, student_id), device=db.get(Device, payload.device_id), user=user)  # validate + queue
++    db.commit()  # save with its audit row
++    return _command_out(db, cmd)  # the dashboard tracks it like a fingerprint enrolment
++
++
++@router.post("/admin/students/{student_id}/face/verify", response_model=CommandOut, status_code=status.HTTP_201_CREATED, tags=["admin"])  # admin: test a face match (no attendance)
++def face_verify_admin(student_id: int, payload: FaceDeviceIn, user: AdminUser, db: DbSession) -> CommandOut:  # admin only
++    cmd = face_service.queue_face(db, kind=CommandType.face_verify, student=db.get(Student, student_id), device=db.get(Device, payload.device_id), user=user)  # validate + queue
++    db.commit()  # save
++    return _command_out(db, cmd)  # tracked on the student page
++
++
++@router.delete("/admin/students/{student_id}/face", status_code=status.HTTP_204_NO_CONTENT, tags=["admin"])  # admin: delete the face template (POPIA)
++def face_delete(student_id: int, user: AdminUser, db: DbSession) -> None:  # admin only
++    if db.get(Student, student_id) is None:  # bad id
++        raise HTTPException(status.HTTP_404_NOT_FOUND, "student_not_found")  # stop
++    db.execute(delete(FaceTemplate).where(FaceTemplate.student_id == student_id))  # remove
++    write_audit(db, actor=user, action="face.deleted", entity="students", entity_id=student_id, details={})  # audit
++    db.commit()  # save
++
++
++@router.post("/lecturer/sessions/{session_id}/face-verify", response_model=CommandOut, status_code=status.HTTP_201_CREATED, tags=["lecturer"])  # lecturer: verify a student by face; marks present on a match
++def face_verify_lecturer(session_id: int, payload: FaceVerifyIn, user: StaffUser, db: DbSession) -> CommandOut:  # lecturer or admin
++    session = get_session_for_user(db, user, session_id)  # 404 if not theirs
++    if session.closed_at is not None:  # the terminal has moved on
++        raise HTTPException(status.HTTP_409_CONFLICT, "session_already_closed")  # stop
++    student = db.scalars(select(Student).where(Student.student_number == payload.student_number)).first()  # who
++    if student is None:  # unknown number
++        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown_student")  # stop
++    if db.get(CourseStudent, (session.course_id, student.id)) is None:  # not on the class list
++        raise HTTPException(status.HTTP_400_BAD_REQUEST, "not_in_course")  # stop
++    cmd = face_service.queue_face(db, kind=CommandType.face_verify, student=student, device=db.get(Device, session.device_id), user=user, session=session)  # the session's terminal
++    db.commit()  # save
++    return _command_out(db, cmd)  # roster turns present when it matches
++
++
++@router.post("/device/commands/{command_id}/face", response_model=FaceResultOut, tags=["device"])  # terminal uploads the raw picture
++async def face_upload(command_id: int, request: Request, device: CurrentDevice, db: DbSession) -> FaceResultOut:  # signed like every /device call
++    raw = await request.body()  # exact bytes (already checked by the signature)
++    return FaceResultOut(**face_service.handle_frame(db, device=device, command_id=command_id, raw=raw))  # analyse + reply
+diff --git a/Backend/app/schemas/device.py b/Backend/app/schemas/device.py
+index 1fcb21c..baec450 100644
+--- a/Backend/app/schemas/device.py
++++ b/Backend/app/schemas/device.py
+@@ -25,7 +25,7 @@ class AttendanceOut(BaseModel):  # decision the terminal turns into LCD/LED/buzz
+ 
+ class DeviceCommandOut(BaseModel):  # next job for the terminal (enrol a finger / wipe a slot)
+     command_id: int  # echoed back in the result call
+-    type: Literal["enrol", "delete_slot"]  # what to do
++    type: Literal["enrol", "delete_slot", "face_enrol", "face_verify"]  # what to do (face types: FACE)
+     slot_number: int  # sensor slot to fill or wipe
+     student_number: str | None  # LCD info for enrol (None for wipes)
+     full_name: str | None  # LCD shows "Enrol: <name>"
+diff --git a/Backend/app/services/commands.py b/Backend/app/services/commands.py
+index f729769..e94bd31 100644
+--- a/Backend/app/services/commands.py
++++ b/Backend/app/services/commands.py
+@@ -7,10 +7,12 @@ from sqlalchemy.exc import IntegrityError  # unique-constraint clashes
+ from sqlalchemy.orm import Session  # DB session type
+ 
+ from app.config import settings  # fp_slot_capacity, command_ttl_minutes
+-from app.models import CommandStatus, CommandType, Device, DeviceCommand, FingerprintSlot, Student, User  # tables used here
++from app.models import CommandStatus, CommandType, Device, DeviceCommand, FaceTemplate, FingerprintSlot, Student, User  # tables used here (FaceTemplate: FACE)
+ from app.services.audit import write_audit  # audit trail
+ 
+ OPEN_STATUSES = (CommandStatus.pending, CommandStatus.in_progress)  # commands that still hold a slot
++CAPTURE_TYPES = (CommandType.enrol, CommandType.face_enrol, CommandType.face_verify)  # FACE: commands that capture a biometric (need consent)
++FACE_TYPES = (CommandType.face_enrol, CommandType.face_verify)  # FACE: face picture commands
+ MAX_SKIPS = 10  # max commands cancelled in one /next call before giving up
+ 
+ 
+@@ -128,6 +130,12 @@ def delete_student_biometrics(db: Session, *, student: Student, device_id: int |
+         wipe = _cancel(db, cmd, "biometrics_deleted", now)  # stop them
+         if wipe is not None:  # it had been claimed, so a wipe was queued too
+             wipes.append(wipe)  # include it in the response
++    face_rows = db.execute(delete(FaceTemplate).where(FaceTemplate.student_id == student.id)).rowcount if device_id is None else 0  # FACE: POPIA - the face template goes too (all-terminal deletions only)
++    if device_id is None:  # FACE: stop any face pictures still waiting for this student
++        for cmd in db.scalars(select(DeviceCommand).where(DeviceCommand.student_id == student.id, DeviceCommand.type.in_(FACE_TYPES), DeviceCommand.status.in_(OPEN_STATUSES))).all():  # FACE: open face commands
++            _cancel(db, cmd, "biometrics_deleted", now)  # FACE: cancel (no sensor wipe needed for faces)
++    if face_rows:  # FACE: something was deleted
++        write_audit(db, actor=admin, action="face.deleted", entity="students", entity_id=student.id, details={})  # FACE: audit
+     db.flush()  # make sure everything has IDs
+     write_audit(db, actor=admin, action="fingerprint.deleted", entity="students", entity_id=student.id, details={"device_id": device_id, "slots": removed})  # audit
+     return wipes  # caller commits
+@@ -165,14 +173,14 @@ def next_command(db: Session, device: Device) -> NextCommand | None:  # terminal
+         if cmd is None:  # nothing to do
+             return None  # router sends 204
+         student = db.get(Student, cmd.student_id) if cmd.student_id is not None else None  # who it's for
+-        if cmd.type == CommandType.enrol and (student is None or not student.is_active or not student.biometric_consent):  # consent gone since queueing
++        if cmd.type in CAPTURE_TYPES and (student is None or not student.is_active or not student.biometric_consent):  # consent gone since queueing (FACE: face commands too)
+             _cancel(db, cmd, "consent_withdrawn", now)  # don't capture a finger without consent
+             db.commit()  # save and look again
+             continue  # next command
+         if cmd.status == CommandStatus.pending:  # first time the terminal sees it
+             cmd.status = CommandStatus.in_progress  # claimed
+             cmd.claimed_at = now  # when
+-            if cmd.type == CommandType.enrol:  # the student needs time at the terminal
++            if cmd.type in CAPTURE_TYPES:  # the student needs time at the terminal (FACE: face commands too)
+                 cmd.expires_at = now + timedelta(minutes=settings.command_ttl_minutes)  # fresh deadline from now
+         db.commit()  # save the claim
+         return NextCommand(cmd, student)  # hand it to the terminal
+@@ -204,6 +212,12 @@ def report_result(db: Session, *, device: Device, command_id: int, success: bool
+         write_audit(db, actor=actor, action="fingerprint.slot_wiped", entity="device_commands", entity_id=cmd.id, details={"device_id": device.id, "slot": cmd.slot_number, "student_id": cmd.student_id})  # audit
+         db.commit()  # save
+         return cmd  # done
++    if cmd.type in FACE_TYPES:  # FACE: the template/attendance was already handled by /face; just close the command
++        cmd.status = CommandStatus.done  # FACE: success
++        cmd.result_detail = detail  # FACE: e.g. face_enrolled / face_verified
++        cmd.completed_at = now  # FACE: finished
++        db.commit()  # FACE: save
++        return cmd  # FACE: done
+     student = db.get(Student, cmd.student_id) if cmd.student_id is not None else None  # enrolled student
+     if student is None or not student.is_active or not student.biometric_consent:  # consent withdrawn during capture
+         cmd.status = CommandStatus.cancelled  # don't keep it
+diff --git a/Backend/app/services/face.py b/Backend/app/services/face.py
+new file mode 100644
+index 0000000..ca1b48c
+--- /dev/null
++++ b/Backend/app/services/face.py
+@@ -0,0 +1,190 @@
++import os  # settings from the environment
++import threading  # load the models once, safely
++import urllib.request  # download the models if missing
++from datetime import datetime, timedelta, timezone  # deadlines
++from pathlib import Path  # model file paths
++
++import numpy as np  # picture bytes -> array
++from fastapi import HTTPException, status  # validation errors
++from sqlalchemy import select  # query builder
++from sqlalchemy.exc import IntegrityError  # duplicate attendance race
++from sqlalchemy.orm import Session  # DB session type
++
++from app.config import settings  # command_ttl_minutes
++from app.models import Attendance, CommandStatus, CommandType, CourseStudent, Device, DeviceCommand, FaceTemplate, LectureSession, Method, Student, User  # tables used here
++from app.services.audit import write_audit  # audit trail
++from app.services.commands import OPEN_STATUSES, expire_stale  # shared command helpers
++
++FRAME_W, FRAME_H = 320, 240  # picture size the terminal sends (QVGA greyscale)
++FRAME_LEN = FRAME_W * FRAME_H  # 76 800 bytes, one per pixel
++MATCH_THRESHOLD = float(os.getenv("face_match_threshold", "0.363"))  # cosine similarity needed for a match (OpenCV's SFace default; tune on Render)
++MIN_FACE_PX = int(os.getenv("face_min_size", "50"))  # smaller faces are too far away to trust
++MODELS_DIR = Path(__file__).resolve().parents[2] / "models"  # Backend/models (git-ignored, downloaded)
++MODELS = {  # file name -> download address (OpenCV model zoo)
++    "face_detection_yunet_2023mar.onnx": "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",  # face finder (~0.2 MB)
++    "face_recognition_sface_2021dec.onnx": "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx",  # face -> 128 numbers (~37 MB)
++}
++
++_lock = threading.Lock()  # one loader at a time
++_detector = None  # cv2.FaceDetectorYN, created once
++_recognizer = None  # cv2.FaceRecognizerSF, created once
++
++
++def _now() -> datetime:  # one place for "now"
++    return datetime.now(timezone.utc)  # always timezone-aware UTC
++
++
++def download_models() -> None:  # fetch any missing model file (build step, start-up thread, or first use)
++    MODELS_DIR.mkdir(parents=True, exist_ok=True)  # make the folder
++    for name, url in MODELS.items():  # each model
++        path = MODELS_DIR / name  # where it goes
++        if path.exists() and path.stat().st_size > 100_000:  # already there (a tiny file would be a failed download)
++            continue  # skip
++        tmp = path.with_suffix(".part")  # download to a temp name first
++        urllib.request.urlretrieve(url, tmp)  # follows GitHub's redirect to the real file
++        tmp.replace(path)  # only now is it "there"
++
++
++def _models():  # the detector and recognizer, loaded on first use
++    global _detector, _recognizer  # module-level cache
++    with _lock:  # only one thread loads
++        if _detector is None or _recognizer is None:  # not loaded yet
++            import cv2  # imported here so the rest of the API starts even if OpenCV is missing
++            try:  # download can fail (no network)
++                download_models()  # make sure the files exist
++            except Exception as exc:  # report as 503
++                raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "face_models_missing") from exc  # terminal shows the error
++            _detector = cv2.FaceDetectorYN.create(str(MODELS_DIR / "face_detection_yunet_2023mar.onnx"), "", (FRAME_W, FRAME_H), 0.7, 0.3, 50)  # score 0.7, NMS 0.3, max 50 faces
++            _recognizer = cv2.FaceRecognizerSF.create(str(MODELS_DIR / "face_recognition_sface_2021dec.onnx"), "")  # 128-number embeddings
++    return _detector, _recognizer  # ready
++
++
++def preload() -> None:  # called in a background thread at start-up so the first picture isn't slow
++    try:  # never crash the API because of this
++        _models()  # download + load
++    except Exception as exc:  # e.g. no network yet
++        print(f"face models not loaded yet: {exc}")  # first real request will try again
++
++
++def analyse(raw: bytes) -> tuple[str, np.ndarray | None]:  # picture -> ("ok", embedding) or (problem, None)
++    import cv2  # OpenCV
++    detector, recognizer = _models()  # loaded models
++    grey = np.frombuffer(raw, dtype=np.uint8).reshape(FRAME_H, FRAME_W)  # 240 rows x 320 columns
++    bgr = cv2.cvtColor(grey, cv2.COLOR_GRAY2BGR)  # the models expect 3 channels
++    detector.setInputSize((FRAME_W, FRAME_H))  # picture size
++    _, faces = detector.detect(bgr)  # each row: x, y, w, h, 10 landmark numbers, score
++    if faces is None or len(faces) == 0:  # nobody found
++        return "no_face", None  # ask for a retake
++    faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)  # biggest face first
++    if len(faces) > 1 and faces[1][2] * faces[1][3] >= 0.5 * faces[0][2] * faces[0][3]:  # a second face nearly as big
++        return "multiple_faces", None  # one person at a time
++    face = faces[0]  # the student
++    if face[2] < MIN_FACE_PX:  # face too small (too far away)
++        return "poor_quality", None  # ask them to come closer
++    aligned = recognizer.alignCrop(bgr, face)  # straighten and crop the face
++    feature = recognizer.feature(aligned).astype(np.float32).copy()  # 1 x 128 numbers
++    return "ok", feature  # usable
++
++
++def similarity(a: np.ndarray, b: np.ndarray) -> float:  # cosine similarity, 1.0 = identical
++    import cv2  # OpenCV
++    _, recognizer = _models()  # loaded models
++    return float(recognizer.match(a, b, cv2.FaceRecognizerSF_FR_COSINE))  # SFace's own comparison
++
++
++def queue_face(db: Session, *, kind: CommandType, student: Student | None, device: Device | None, user: User, session: LectureSession | None = None) -> DeviceCommand:  # dashboard asks a terminal for a face picture
++    if student is None:  # bad student
++        raise HTTPException(status.HTTP_404_NOT_FOUND, "student_not_found")  # stop
++    if device is None:  # bad device
++        raise HTTPException(status.HTTP_404_NOT_FOUND, "device_not_found")  # stop
++    if not student.is_active:  # deactivated
++        raise HTTPException(status.HTTP_400_BAD_REQUEST, "student_inactive")  # stop
++    if not device.is_active:  # revoked terminal
++        raise HTTPException(status.HTTP_400_BAD_REQUEST, "device_inactive")  # stop
++    if not student.biometric_consent:  # POPIA: no consent, no biometrics
++        raise HTTPException(status.HTTP_403_FORBIDDEN, "no_consent")  # use the manual fallback
++    if kind == CommandType.face_verify and db.scalars(select(FaceTemplate).where(FaceTemplate.student_id == student.id)).first() is None:  # nothing to compare with
++        raise HTTPException(status.HTTP_409_CONFLICT, "face_not_enrolled")  # enrol the face first
++    now = _now()  # one timestamp
++    expire_stale(db, device.id, now)  # old commands shouldn't block this one
++    pending = db.scalars(select(DeviceCommand).where(DeviceCommand.device_id == device.id, DeviceCommand.student_id == student.id, DeviceCommand.type.in_((CommandType.face_enrol, CommandType.face_verify)), DeviceCommand.status.in_(OPEN_STATUSES))).first()  # already waiting?
++    if pending is not None:  # one at a time per student and terminal
++        raise HTTPException(status.HTTP_409_CONFLICT, "face_pending")  # stop
++    cmd = DeviceCommand(  # the face command
++        device_id=device.id,  # target terminal
++        type=kind,  # face_enrol / face_verify
++        status=CommandStatus.pending,  # waiting for the terminal
++        slot_number=0,  # faces don't use sensor slots
++        student_id=student.id,  # who
++        requested_by_user_id=user.id,  # admin or lecturer
++        session_id=session.id if session is not None else None,  # lecturer verify: mark present here on a match
++        expires_at=now + timedelta(minutes=settings.command_ttl_minutes),  # times out like enrolments
++    )
++    db.add(cmd)  # queue
++    db.flush()  # get cmd.id
++    write_audit(db, actor=user, action="face.enrol_requested" if kind == CommandType.face_enrol else "face.verify_requested", entity="students", entity_id=student.id, details={"device_id": device.id, "command_id": cmd.id, "session_id": cmd.session_id})  # audit
++    return cmd  # caller commits
++
++
++def handle_frame(db: Session, *, device: Device, command_id: int, raw: bytes) -> dict:  # terminal uploaded a picture for a face command
++    cmd = db.get(DeviceCommand, command_id)  # the command
++    if cmd is None or cmd.device_id != device.id:  # missing or another terminal's
++        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown_command")  # stop
++    if cmd.type not in (CommandType.face_enrol, CommandType.face_verify):  # fingerprint command
++        raise HTTPException(status.HTTP_400_BAD_REQUEST, "not_a_face_command")  # stop
++    if cmd.status != CommandStatus.in_progress:  # expired, cancelled or finished
++        raise HTTPException(status.HTTP_409_CONFLICT, "command_not_active")  # terminal stops
++    if len(raw) != FRAME_LEN:  # wrong size
++        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "bad_frame_length")  # terminal retakes
++    student = db.get(Student, cmd.student_id) if cmd.student_id is not None else None  # who
++    if student is None or not student.is_active or not student.biometric_consent:  # consent withdrawn meanwhile
++        raise HTTPException(status.HTTP_409_CONFLICT, "command_not_active")  # don't process biometrics
++    result, feature = analyse(raw)  # find the face, make the template
++    out = {"status": result, "full_name": student.full_name, "score": None, "attendance": None}  # reply for the terminal
++    if result != "ok":  # no usable face: the picture is thrown away
++        return out  # terminal retakes
++    actor = db.get(User, cmd.requested_by_user_id) if cmd.requested_by_user_id is not None else None  # who asked
++    if cmd.type == CommandType.face_enrol:  # store the template
++        row = db.scalars(select(FaceTemplate).where(FaceTemplate.student_id == student.id)).first()  # existing one?
++        if row is None:  # first enrolment
++            db.add(FaceTemplate(student_id=student.id, embedding=feature.tobytes()))  # save
++        else:  # re-enrolment replaces it
++            row.embedding = feature.tobytes()  # overwrite
++            row.created_at = _now()  # new date
++        write_audit(db, actor=actor, action="face.enrolled", entity="students", entity_id=student.id, details={"device_id": device.id, "command_id": cmd.id})  # audit
++        db.commit()  # save
++        return out  # status ok
++    row = db.scalars(select(FaceTemplate).where(FaceTemplate.student_id == student.id)).first()  # stored template
++    if row is None:  # deleted since queueing
++        out["status"] = "face_not_enrolled"  # tell the terminal
++        return out  # stop
++    score = similarity(np.frombuffer(row.embedding, dtype=np.float32).reshape(1, -1), feature)  # compare
++    out["score"] = round(score, 3)  # for the log / tuning
++    if score < MATCH_THRESHOLD:  # not the same person
++        out["status"] = "no_match"  # reject
++        write_audit(db, actor=actor, action="face.verify_failed", entity="students", entity_id=student.id, details={"device_id": device.id, "command_id": cmd.id, "score": out["score"]})  # audit
++        db.commit()  # save
++        return out  # terminal shows "does not match"
++    write_audit(db, actor=actor, action="face.verified", entity="students", entity_id=student.id, details={"device_id": device.id, "command_id": cmd.id, "score": out["score"], "session_id": cmd.session_id})  # audit
++    if cmd.session_id is not None:  # lecturer verify: mark present
++        out["attendance"] = _mark_present(db, session_id=cmd.session_id, student=student, device=device, score=score, actor=actor)  # recorded / already_present / ...
++    db.commit()  # save everything
++    return out  # status ok
++
++
++def _mark_present(db: Session, *, session_id: int, student: Student, device: Device, score: float, actor: User | None) -> str:  # face-verified attendance
++    session = db.get(LectureSession, session_id)  # the session
++    if session is None:  # deleted
++        return "unknown_session"  # nothing to do
++    if db.get(CourseStudent, (session.course_id, student.id)) is None:  # not on the class list
++        return "not_in_course"  # nothing saved
++    existing = db.scalars(select(Attendance).where(Attendance.student_id == student.id, Attendance.session_id == session.id)).first()  # already a row?
++    if existing is not None:  # present, or revoked (only the lecturer reinstates)
++        return "already_present" if existing.revoked_at is None else "revoked"  # nothing new
++    try:  # unique constraint is the final guard
++        with db.begin_nested():  # savepoint
++            db.add(Attendance(session_id=session.id, student_id=student.id, device_id=device.id, method=Method.face, recorded_by_user_id=actor.id if actor else None, note=f"Face verified (score {score:.2f})"))  # the record
++    except IntegrityError:  # raced with a fingerprint scan
++        return "already_present"  # fine
++    write_audit(db, actor=actor, action="attendance.face", entity="attendance", entity_id=f"{session.id}:{student.id}", details={"score": round(score, 3)})  # audit
++    return "recorded"  # present
+diff --git a/Backend/migrations/versions/f7c1a9e2d4b6_face_templates_and_commands.py b/Backend/migrations/versions/f7c1a9e2d4b6_face_templates_and_commands.py
+new file mode 100644
+index 0000000..265ba11
+--- /dev/null
++++ b/Backend/migrations/versions/f7c1a9e2d4b6_face_templates_and_commands.py
+@@ -0,0 +1,44 @@
++"""face templates and face commands
++
++Revision ID: f7c1a9e2d4b6
++Revises: c483c59c3d50
++Create Date: 2026-11-02 10:00:00
++
++"""
++from typing import Sequence, Union
++
++from alembic import op  # migration helpers
++import sqlalchemy as sa  # column types
++
++
++# revision identifiers, used by Alembic.
++revision: str = 'f7c1a9e2d4b6'
++down_revision: Union[str, Sequence[str], None] = 'c483c59c3d50'
++branch_labels: Union[str, Sequence[str], None] = None
++depends_on: Union[str, Sequence[str], None] = None
++
++
++def upgrade() -> None:
++    with op.get_context().autocommit_block():  # Postgres adds enum values outside a transaction
++        op.execute("ALTER TYPE command_type ADD VALUE IF NOT EXISTS 'face_enrol'")  # admin: store a face
++        op.execute("ALTER TYPE command_type ADD VALUE IF NOT EXISTS 'face_verify'")  # admin/lecturer: check a face
++    op.add_column("device_commands", sa.Column("session_id", sa.Integer(), nullable=True))  # session to mark present after a lecturer's verify
++    op.create_foreign_key("fk_device_commands_session_id_sessions", "device_commands", "sessions", ["session_id"], ["id"], ondelete="SET NULL")  # link
++    op.create_table(  # one face template per student
++        "face_templates",
++        sa.Column("id", sa.Integer(), nullable=False),  # primary key
++        sa.Column("student_id", sa.Integer(), nullable=False),  # owner
++        sa.Column("embedding", sa.LargeBinary(), nullable=False),  # 128 float32 = 512 bytes
++        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),  # enrolled at
++        sa.ForeignKeyConstraint(["student_id"], ["students.id"], name="fk_face_templates_student_id_students", ondelete="CASCADE"),  # deleted with the student
++        sa.PrimaryKeyConstraint("id", name="pk_face_templates"),  # primary key
++        sa.UniqueConstraint("student_id", name="uq_face_templates_student_id"),  # one per student
++    )
++
++
++def downgrade() -> None:
++    op.drop_table("face_templates")  # templates
++    op.drop_constraint("fk_device_commands_session_id_sessions", "device_commands", type_="foreignkey")  # link
++    op.drop_column("device_commands", "session_id")  # column
++    op.execute("DELETE FROM device_commands WHERE type IN ('face_enrol', 'face_verify')")  # rows using the new values
++    # Postgres can't drop single enum values; 'face_enrol'/'face_verify' stay in command_type (harmless).
+diff --git a/Backend/requirements.txt b/Backend/requirements.txt
+index e335e60..121bfac 100644
+--- a/Backend/requirements.txt
++++ b/Backend/requirements.txt
+@@ -73,3 +73,5 @@ urllib3==2.8.0
+ uvicorn==0.54.0
+ watchfiles==1.3.0
+ websockets==16.1.1
++numpy==2.2.6
++opencv-python-headless==4.10.0.84
+diff --git a/Backend/scripts/get_face_models.py b/Backend/scripts/get_face_models.py
+new file mode 100644
+index 0000000..47a15d1
+--- /dev/null
++++ b/Backend/scripts/get_face_models.py
+@@ -0,0 +1,6 @@
++from app.services.face import MODELS_DIR, download_models  # model list + downloader
++
++
++if __name__ == "__main__":  # python -m scripts.get_face_models
++    download_models()  # fetch YuNet + SFace into Backend/models
++    print("Face models ready in", MODELS_DIR)  # confirm
+diff --git a/Backend/tests/test_face.py b/Backend/tests/test_face.py
+new file mode 100644
+index 0000000..00e8bbe
+--- /dev/null
++++ b/Backend/tests/test_face.py
+@@ -0,0 +1,96 @@
++import secrets  # nonces
++import time  # timestamps
++
++import numpy as np  # fake embeddings
++import pytest  # fixtures
++
++from sqlalchemy import select  # DB checks
++
++from app.db import SessionLocal  # direct DB access
++from app.models import Attendance, AuditLog, CommandStatus, DeviceCommand, FaceTemplate, Method  # tables checked
++from app.security import compute_signature  # sign raw picture uploads
++from app.services import face as face_service  # patched: no real models in tests
++
++PICTURE = bytes(320 * 240)  # a blank 320x240 greyscale picture
++
++
++@pytest.fixture
++def fake_models(monkeypatch):  # replace OpenCV with predictable answers
++    state = {"result": "ok", "score": 0.9}  # what the "models" say
++    monkeypatch.setattr(face_service, "analyse", lambda raw: (state["result"], np.ones((1, 128), np.float32) if state["result"] == "ok" else None))  # detection + embedding
++    monkeypatch.setattr(face_service, "similarity", lambda a, b: state["score"])  # comparison
++    return state  # tests change it
++
++
++def upload(client, world, command_id, body=PICTURE):  # signed raw upload, like the terminal
++    path = f"/device/commands/{command_id}/face"  # endpoint
++    ts, nonce = int(time.time()), secrets.token_hex(16)  # fresh
++    sig = compute_signature(world["secret"], "POST", path, ts, nonce, body)  # over the raw bytes
++    headers = {"X-Device-Id": str(world["device_id"]), "X-Timestamp": str(ts), "X-Nonce": nonce, "X-Signature": sig, "Content-Type": "application/octet-stream"}  # auth
++    return client.post(path, content=body, headers=headers)  # send
++
++
++def claim(call):  # terminal polls and claims the next command
++    r = call("GET", "/device/commands/next")  # poll
++    assert r.status_code == 200, r.text  # one is waiting
++    return r.json()  # the command
++
++
++def test_face_enrol_then_lecturer_verify_marks_present(client, world, call, admin_headers, lecturer_headers, fake_models):
++    r = client.post(f"/admin/students/{world['student_yes']}/face/enrol", json={"device_id": world["device_id"]}, headers=admin_headers)  # admin queues enrol
++    assert r.status_code == 201, r.text  # queued
++    cmd = claim(call)  # terminal picks it up
++    assert cmd["type"] == "face_enrol" and cmd["full_name"] == "Has Consent"  # LCD info
++    r = upload(client, world, cmd["command_id"])  # picture
++    assert r.status_code == 200 and r.json()["status"] == "ok", r.text  # stored
++    assert call("POST", f"/device/commands/{cmd['command_id']}/result", {"success": True, "detail": "face_enrolled"}).json()["status"] == "done"  # closed
++    with SessionLocal() as db:  # template saved
++        assert db.scalars(select(FaceTemplate)).first() is not None  # one row
++    assert client.get(f"/admin/students/{world['student_yes']}/face", headers=admin_headers).json()["enrolled"] is True  # status endpoint
++    r = client.post(f"/lecturer/sessions/{world['session_id']}/face-verify", json={"student_number": "111"}, headers=lecturer_headers)  # lecturer asks
++    assert r.status_code == 201, r.text  # queued
++    cmd = claim(call)  # terminal
++    assert cmd["type"] == "face_verify"  # verify
++    body = upload(client, world, cmd["command_id"]).json()  # picture
++    assert body["status"] == "ok" and body["attendance"] == "recorded", body  # present
++    with SessionLocal() as db:  # attendance row
++        row = db.scalars(select(Attendance)).first()  # the only one
++        assert row.method == Method.face  # by face
++    with SessionLocal() as db:  # audit trail
++        assert "face.verified" in list(db.scalars(select(AuditLog.action)))  # audited
++
++
++def test_retake_statuses_and_no_match(client, world, call, admin_headers, fake_models):
++    client.post(f"/admin/students/{world['student_yes']}/face/enrol", json={"device_id": world["device_id"]}, headers=admin_headers)  # queue
++    cmd = claim(call)  # claim
++    fake_models["result"] = "no_face"  # empty picture
++    assert upload(client, world, cmd["command_id"]).json()["status"] == "no_face"  # retake asked
++    fake_models["result"] = "ok"  # good picture
++    assert upload(client, world, cmd["command_id"]).json()["status"] == "ok"  # stored
++    call("POST", f"/device/commands/{cmd['command_id']}/result", {"success": True})  # close
++    client.post(f"/admin/students/{world['student_yes']}/face/verify", json={"device_id": world["device_id"]}, headers=admin_headers)  # admin test
++    cmd = claim(call)  # claim
++    fake_models["score"] = 0.1  # different person
++    body = upload(client, world, cmd["command_id"]).json()  # picture
++    assert body["status"] == "no_match" and body["attendance"] is None  # rejected, nothing recorded
++
++
++def test_guards(client, world, call, admin_headers, lecturer_headers, fake_models):
++    assert client.post(f"/admin/students/{world['student_no']}/face/enrol", json={"device_id": world["device_id"]}, headers=admin_headers).json()["detail"] == "no_consent"  # POPIA
++    assert client.post(f"/admin/students/{world['student_yes']}/face/verify", json={"device_id": world["device_id"]}, headers=admin_headers).json()["detail"] == "face_not_enrolled"  # nothing to compare
++    assert client.post(f"/lecturer/sessions/{world['session_id']}/face-verify", json={"student_number": "333"}, headers=lecturer_headers).json()["detail"] == "not_in_course"  # roster
++    client.post(f"/admin/students/{world['student_yes']}/face/enrol", json={"device_id": world["device_id"]}, headers=admin_headers)  # queue
++    assert client.post(f"/admin/students/{world['student_yes']}/face/enrol", json={"device_id": world["device_id"]}, headers=admin_headers).json()["detail"] == "face_pending"  # one at a time
++    cmd = claim(call)  # claim
++    assert upload(client, world, cmd["command_id"], body=b"x" * 10).status_code == 422  # wrong size
++
++
++def test_consent_withdrawal_deletes_face(client, world, call, admin_headers, fake_models):
++    client.post(f"/admin/students/{world['student_yes']}/face/enrol", json={"device_id": world["device_id"]}, headers=admin_headers)  # queue
++    cmd = claim(call)  # claim
++    upload(client, world, cmd["command_id"])  # stored
++    call("POST", f"/device/commands/{cmd['command_id']}/result", {"success": True})  # close
++    r = client.put(f"/admin/students/{world['student_yes']}/consent", json={"consent": False}, headers=admin_headers)  # withdraw
++    assert r.status_code == 200, r.text  # ok
++    with SessionLocal() as db:  # template gone
++        assert db.scalars(select(FaceTemplate)).first() is None  # POPIA
+diff --git a/Frontend/src/app/(app)/admin/students/[id]/page.tsx b/Frontend/src/app/(app)/admin/students/[id]/page.tsx
+index 8260a79..03b8dc0 100644
+--- a/Frontend/src/app/(app)/admin/students/[id]/page.tsx
++++ b/Frontend/src/app/(app)/admin/students/[id]/page.tsx
+@@ -16,6 +16,7 @@ import { ConsentBadge } from "@/components/admin/consent-badge"; // consent pill
+ import { EditStudentDialog } from "@/components/admin/edit-student-dialog"; // rename
+ import { countdown, EnrolDialog } from "@/components/admin/enrol-dialog"; // guided enrolment
+ import { RecordConsentDialog } from "@/components/admin/record-consent-dialog"; // grant consent
++import { FaceCard } from "@/components/face/face-card"; // FACE: enrol / verify face
+ import { ConfirmDialog } from "@/components/confirm-dialog"; // destructive confirms
+ import { EmptyState } from "@/components/empty-state"; // not found
+ import { PageHeader } from "@/components/page-header"; // title row
+@@ -164,6 +165,9 @@ function StudentView({ studentId }: { studentId: number }) { // split out so hoo
+             )}
+           </Card>
+ 
++          {/* FACE: face card */}
++          <FaceCard student={s} />
++
+           {/* Card 3 — terminal activity */}
+           <Card title="Terminal activity">
+             {s.open_commands.length === 0 && finished.length === 0 && <p className="text-sm text-muted-foreground">No pending terminal activity.</p>}
+diff --git a/Frontend/src/app/(app)/lecturer/sessions/[id]/page.tsx b/Frontend/src/app/(app)/lecturer/sessions/[id]/page.tsx
+index 9ebc5fb..11d50d1 100644
+--- a/Frontend/src/app/(app)/lecturer/sessions/[id]/page.tsx
++++ b/Frontend/src/app/(app)/lecturer/sessions/[id]/page.tsx
+@@ -13,6 +13,7 @@ import { CloseSessionDialog } from "@/components/lecturer/close-session-dialog";
+ import { ExportButton } from "@/components/lecturer/export-button"; // CSV
+ import { ManualMarkDialog, type MarkTarget } from "@/components/lecturer/manual-mark-dialog"; // mark / reinstate
+ import { RevokeDialog } from "@/components/lecturer/revoke-dialog"; // revoke
++import { FaceVerifyPanel } from "@/components/face/face-verify-panel"; // FACE: verify by face
+ import { ROSTER_TABS, RosterTable, type RosterTab } from "@/components/lecturer/roster-table"; // the class list
+ import { useRoster, useSession } from "@/hooks/use-lecturer"; // data
+ import { useNow } from "@/hooks/use-now"; // "Updated 2 s ago" ticker
+@@ -138,6 +139,8 @@ function LiveSession({ sessionId }: { sessionId: number }) { // split out so hoo
+       {/* roster */}
+       <section aria-labelledby="roster-heading" className="space-y-3">
+         <h2 id="roster-heading" className="text-lg font-semibold">Class list</h2>
++        {/* FACE: verify an absent student by face (open sessions only) */}
++        {session?.is_open && entries && <FaceVerifyPanel sessionId={sessionId} entries={entries} />}
+         {/* error with retry (only when nothing has loaded yet) */}
+         {roster.isError && !entries && (
+           <div role="alert" className="flex flex-wrap items-center gap-3 rounded-lg border border-danger/40 bg-danger-soft px-4 py-3 text-sm text-danger">
+diff --git a/Frontend/src/components/admin/command-type-label.tsx b/Frontend/src/components/admin/command-type-label.tsx
+index a99fcc0..98c2cb7 100644
+--- a/Frontend/src/components/admin/command-type-label.tsx
++++ b/Frontend/src/components/admin/command-type-label.tsx
+@@ -1,11 +1,13 @@
+-import { Eraser, Fingerprint } from "lucide-react"; // icons
++import { Eraser, Fingerprint, ScanFace } from "lucide-react"; // icons (ScanFace: FACE)
+ import type { CommandType } from "@/lib/types"; // enrol | delete_slot
+ 
+ export function commandTypeText(type: CommandType): string { // plain text version
++  if (type === "face_enrol") return "Enrol face"; // FACE
++  if (type === "face_verify") return "Verify face"; // FACE
+   return type === "enrol" ? "Enrol fingerprint" : "Wipe slot"; // admin spec §3.1
+ }
+ 
+ export function CommandTypeLabel({ type }: { type: CommandType }) { // icon + label
+-  const Icon = type === "enrol" ? Fingerprint : Eraser; // pick the icon
++  const Icon = type === "face_enrol" || type === "face_verify" ? ScanFace : type === "enrol" ? Fingerprint : Eraser; // pick the icon (ScanFace: FACE)
+   return <span className="inline-flex items-center gap-1.5 text-sm font-medium whitespace-nowrap text-ink"><Icon className="size-4 text-muted-foreground" aria-hidden />{commandTypeText(type)}</span>; // e.g. "Wipe slot"
+ }
+diff --git a/Frontend/src/components/face/face-card.tsx b/Frontend/src/components/face/face-card.tsx
+new file mode 100644
+index 0000000..86aef42
+--- /dev/null
++++ b/Frontend/src/components/face/face-card.tsx
+@@ -0,0 +1,68 @@
++"use client"; // FACE: admin face enrol / verify card for the student page
++
++import { useState } from "react"; // local state
++import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"; // data fetching
++import { ScanFace, Trash2 } from "lucide-react"; // icons
++import { toast } from "sonner"; // feedback
++import { Button } from "@/components/ui/button"; // actions
++import { useAdminDevices } from "@/hooks/use-admin"; // terminal list
++import { apiFetch } from "@/lib/api"; // HTTP layer
++import { useToken } from "@/lib/auth"; // bearer token
++import { errorMessage } from "@/lib/errors"; // friendly error text
++import { fmtDateTime } from "@/lib/format"; // dates
++import type { CommandOut, StudentDetail } from "@/lib/types"; // shapes
++
++interface FaceStatus { enrolled: boolean; enrolled_at: string | null; } // GET /admin/students/{id}/face
++
++export function FaceCard({ student }: { student: StudentDetail }) { // face card: status + enrol/verify/delete
++  const token = useToken(); // auth
++  const qc = useQueryClient(); // refresh other cards after an action
++  const devices = useAdminDevices(10_000); // terminals (online dots)
++  const active = (devices.data ?? []).filter((d) => d.is_active); // only usable terminals
++  const [deviceId, setDeviceId] = useState<number | null>(null); // chosen terminal
++  const chosen = deviceId ?? active[0]?.id ?? null; // default: first terminal
++  const status = useQuery({ // is a face enrolled?
++    queryKey: ["admin", "face", student.id], // cache key
++    queryFn: ({ signal }) => apiFetch<FaceStatus>(`/admin/students/${student.id}/face`, { token, signal }), // request
++    enabled: !!token, // wait for login
++    refetchInterval: 4000, // turns "Enrolled" soon after the terminal finishes
++  });
++  const queue = useMutation({ // POST enrol / verify
++    mutationFn: (kind: "enrol" | "verify") => apiFetch<CommandOut>(`/admin/students/${student.id}/face/${kind}`, { method: "POST", body: { device_id: chosen }, token }), // request
++    onSuccess: (_cmd, kind) => { // queued
++      const name = active.find((d) => d.id === chosen)?.name ?? "the terminal"; // terminal name
++      toast.success(`${kind === "enrol" ? "Face enrolment" : "Face check"} sent. Ask ${student.full_name} to look at the camera on ${name}.`); // instruction
++      qc.invalidateQueries(); // terminal activity card picks it up
++    },
++    onError: (err) => toast.error(errorMessage(err)), // friendly error
++  });
++  const remove = useMutation({ // DELETE face template
++    mutationFn: () => apiFetch<void>(`/admin/students/${student.id}/face`, { method: "DELETE", token }), // request
++    onSuccess: () => { toast.success("Face template deleted."); qc.invalidateQueries(); }, // done
++    onError: (err) => toast.error(errorMessage(err)), // friendly error
++  });
++  const blocker = !student.is_active ? "This student is deactivated." : !student.biometric_consent ? "Record consent first." : active.length === 0 ? "No active terminal." : null; // why buttons are disabled
++  const enrolled = status.data?.enrolled ?? false; // template exists?
++  return (
++    // ruled section, same look as the other cards on this page
++    <section className="space-y-3 rounded-lg border border-rule bg-surface p-4 md:p-5">
++      {/* title row */}
++      <div className="flex flex-wrap items-center justify-between gap-3">
++        <h2 className="text-base font-semibold">Face (backup to fingerprint)</h2>
++        <span className="text-sm text-muted-foreground">{status.isLoading ? "Checking…" : enrolled ? `Enrolled${status.data?.enrolled_at ? ` on ${fmtDateTime(status.data.enrolled_at)}` : ""}` : "Not enrolled"}</span>
++      </div>
++      {/* terminal picker + actions */}
++      <div className="flex flex-wrap items-center gap-2">
++        <label className="text-sm text-muted-foreground" htmlFor="face-terminal">Terminal</label>
++        <select id="face-terminal" className="h-9 rounded-md border border-rule bg-surface px-2 text-sm" value={chosen ?? ""} onChange={(e) => setDeviceId(Number(e.target.value))} disabled={active.length === 0}>
++          {active.map((d) => <option key={d.id} value={d.id}>{d.name}{d.online ? "" : " (offline)"}</option>)}
++        </select>
++        <Button size="sm" disabled={!!blocker || queue.isPending} onClick={() => queue.mutate("enrol")}><ScanFace className="size-3.5" aria-hidden />{enrolled ? "Re-enrol face" : "Enrol face"}</Button>
++        <Button size="sm" variant="outline" disabled={!!blocker || !enrolled || queue.isPending} onClick={() => queue.mutate("verify")}><ScanFace className="size-3.5" aria-hidden />Test face match</Button>
++        {enrolled && <Button size="sm" variant="ghost" className="text-danger hover:bg-danger-soft hover:text-danger" disabled={remove.isPending} onClick={() => { if (window.confirm(`Delete ${student.full_name}'s face template?`)) remove.mutate(); }}><Trash2 className="size-3.5" aria-hidden />Delete face</Button>}
++      </div>
++      {/* help text */}
++      <p className="text-sm text-muted-foreground">{blocker ?? "The terminal shows the student's name and counts down from 3. Only 128 numbers describing the face are stored, never the picture. Progress shows under Terminal activity."}</p>
++    </section>
++  );
++}
+diff --git a/Frontend/src/components/face/face-verify-panel.tsx b/Frontend/src/components/face/face-verify-panel.tsx
+new file mode 100644
+index 0000000..63b8dba
+--- /dev/null
++++ b/Frontend/src/components/face/face-verify-panel.tsx
+@@ -0,0 +1,40 @@
++"use client"; // FACE: lecturer "verify by face" control for the live session page
++
++import { useState } from "react"; // local state
++import { useMutation, useQueryClient } from "@tanstack/react-query"; // data fetching
++import { ScanFace } from "lucide-react"; // icon
++import { toast } from "sonner"; // feedback
++import { Button } from "@/components/ui/button"; // action
++import { apiFetch } from "@/lib/api"; // HTTP layer
++import { useToken } from "@/lib/auth"; // bearer token
++import { errorMessage } from "@/lib/errors"; // friendly error text
++import type { CommandOut, RosterEntry } from "@/lib/types"; // shapes
++
++export function FaceVerifyPanel({ sessionId, entries }: { sessionId: number; entries: RosterEntry[] }) { // pick an absent student, verify on the terminal
++  const token = useToken(); // auth
++  const qc = useQueryClient(); // refresh the roster
++  const absent = entries.filter((e) => e.status === "absent"); // only students not yet present
++  const [number, setNumber] = useState(""); // chosen student number
++  const chosen = number || absent[0]?.student_number || ""; // default: first absent student
++  const verify = useMutation({ // POST face-verify
++    mutationFn: () => apiFetch<CommandOut>(`/lecturer/sessions/${sessionId}/face-verify`, { method: "POST", body: { student_number: chosen }, token }), // request
++    onSuccess: () => { // queued
++      const name = absent.find((e) => e.student_number === chosen)?.full_name ?? chosen; // student name
++      toast.success(`Ask ${name} to look at the terminal's camera. They turn present here if the face matches.`); // instruction
++      qc.invalidateQueries(); // roster refresh
++    },
++    onError: (err) => toast.error(errorMessage(err)), // friendly error
++  });
++  if (absent.length === 0) return null; // everyone is present
++  return (
++    // small ruled bar above the class list
++    <section aria-label="Verify by face" className="flex flex-wrap items-center gap-2 rounded-lg border border-rule bg-surface p-3">
++      <ScanFace className="size-4 text-muted-foreground" aria-hidden />
++      <label htmlFor="face-student" className="text-sm font-medium">Fingerprint not working? Verify by face:</label>
++      <select id="face-student" className="h-9 min-w-0 max-w-full rounded-md border border-rule bg-surface px-2 text-sm" value={chosen} onChange={(e) => setNumber(e.target.value)}>
++        {absent.map((e) => <option key={e.student_id} value={e.student_number}>{e.full_name} ({e.student_number})</option>)}
++      </select>
++      <Button size="sm" disabled={!chosen || verify.isPending} onClick={() => verify.mutate()}>Verify by face</Button>
++    </section>
++  );
++}
+diff --git a/Frontend/src/lib/errors.ts b/Frontend/src/lib/errors.ts
+index 30f6546..7797ad3 100644
+--- a/Frontend/src/lib/errors.ts
++++ b/Frontend/src/lib/errors.ts
+@@ -41,6 +41,9 @@ const MESSAGES: Record<string, string> = { // backend error code → sentence a
+   unknown_command: "Command not found.", // cancel command
+   command_not_active: "That command has already finished.", // cancel finished command
+   wipe_cannot_be_cancelled: "Fingerprint deletions can’t be cancelled (POPIA).", // wipe guard
++  face_not_enrolled: "Enrol this student’s face before verifying it.", // FACE: nothing to compare with
++  face_pending: "A face picture for this student is already waiting on that terminal.", // FACE: queued twice
++  face_models_missing: "The server’s face models aren’t ready yet. Try again in a minute.", // FACE: first start-up
+ };
+ 
+ export function errorMessage(err: unknown): string { // friendly sentence for any thrown error
+diff --git a/Frontend/src/lib/types.ts b/Frontend/src/lib/types.ts
+index 51150a4..486d699 100644
+--- a/Frontend/src/lib/types.ts
++++ b/Frontend/src/lib/types.ts
+@@ -35,7 +35,7 @@ export interface ChangePasswordIn { current_password: string; new_password: stri
+ 
+ // ---- Admin (Phase 2) — copied from Backend/app/schemas/admin.py ----
+ 
+-export type CommandType = "enrol" | "delete_slot"; // what a terminal is asked to do
++export type CommandType = "enrol" | "delete_slot" | "face_enrol" | "face_verify"; // what a terminal is asked to do (face types: FACE)
+ export type CommandStatus = "pending" | "in_progress" | "done" | "failed" | "cancelled" | "expired"; // command life cycle
+ 
+ export interface UserCreate { email: string; full_name: string; role: Role; password: string; } // POST /admin/users
+diff --git a/render.yaml b/render.yaml
+index a4526cd..4ab8a85 100644
+--- a/render.yaml
++++ b/render.yaml
+@@ -5,7 +5,7 @@ services:
+     plan: free                     # free tier
+     region: ohio                   # same region as the Neon database
+     rootDir: Backend               # run everything inside the Backend folder
+-    buildCommand: pip install -r requirements.txt
++    buildCommand: pip install -r requirements.txt && python -m scripts.get_face_models   # FACE: also download the face models
+     startCommand: python -m alembic upgrade head && python -m scripts.seed && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+     healthCheckPath: /health       # Render checks this to know the API is alive
+     envVars:
+@@ -31,3 +31,5 @@ services:
+         value: "30"
+       - key: display_timezone
+         value: Africa/Johannesburg
++      - key: face_match_threshold   # FACE: similarity needed to accept a face (raise to be stricter)
++        value: "0.363"

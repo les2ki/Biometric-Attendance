@@ -81,8 +81,8 @@ def next_device_command(device: CurrentDevice, db: DbSession) -> DeviceCommandOu
         command_id=cmd.id,  # echoed back in the result
         type=cmd.type.value,  # enrol / delete_slot
         slot_number=cmd.slot_number,  # sensor slot
-        student_number=student.student_number if student and cmd.type == CommandType.enrol else None,  # LCD info for enrol only
-        full_name=student.full_name if student and cmd.type == CommandType.enrol else None,  # LCD info for enrol only
+        student_number=student.student_number if student and cmd.type != CommandType.delete_slot else None,  # LCD info for enrol and face commands (FACE)
+        full_name=student.full_name if student and cmd.type != CommandType.delete_slot else None,  # LCD info for enrol and face commands (FACE)
         expires_at=cmd.expires_at,  # deadline (None for wipes)
     )
 

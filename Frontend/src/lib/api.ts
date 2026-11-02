@@ -153,3 +153,15 @@ export function saveBlob(blob: Blob, filename: string): void { // trigger a brow
   link.remove(); // clean up the element
   setTimeout(() => URL.revokeObjectURL(url), 1000); // free the memory once the download has started
 }
+
+export async function fetchBlob(path: string, token: string | null, signal?: AbortSignal): Promise<Blob> { // authenticated binary GET (e.g. the face preview PNG)
+  let res: Response; // the response
+  try { // network failure throws
+    res = await fetch(API_URL + path, { headers: token ? { Authorization: `Bearer ${token}` } : {}, signal, cache: "no-store" }); // never cached
+  } catch (err) { // backend unreachable or aborted
+    if (err instanceof DOMException && err.name === "AbortError") throw err; // let the caller see the abort
+    throw new ApiError(0, "network_error"); // friendly message
+  }
+  if (!res.ok) throw await toApiError(res); // 404 preview_expired etc.
+  return res.blob(); // the bytes
+}

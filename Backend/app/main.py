@@ -11,6 +11,7 @@ admin_courses = import_module(".routers.admin_courses", package=__package__)  # 
 admin_devices = import_module(".routers.admin_devices", package=__package__)  # /admin/devices + /admin/commands
 admin_audit = import_module(".routers.admin_audit", package=__package__)  # /admin/audit (read-only)
 lecturer = import_module(".routers.lecturer", package=__package__)  # /lecturer
+face = import_module(".routers.face", package=__package__)  # FACE: face enrol/verify (dashboard + terminal upload)
 config = import_module(".config", package=__package__)  # settings.cors_origins
 
 
@@ -39,3 +40,4 @@ app.include_router(admin_courses.router)  # tag: admin
 app.include_router(admin_devices.router)  # tag: admin
 app.include_router(admin_audit.router)  # tag: admin
 app.include_router(lecturer.router)  # tag: lecturer
+app.include_router(face.router)  # FACE: tags admin, lecturer, device

@@ -1,7 +1,7 @@
 import enum  # built-in enum support
 from datetime import datetime  # type for timestamp columns
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, JSON, String, UniqueConstraint, func, true  # column types/constraints
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, JSON, LargeBinary, String, UniqueConstraint, func, true  # column types/constraints (LargeBinary: FACE)
 from sqlalchemy.orm import Mapped, mapped_column, relationship  # typed column declarations
 
 from app.db import Base  # shared base with naming convention
@@ -113,6 +113,8 @@ class AuditLog(Base):  # append-only history: enrolments, deletions, overrides, 
 class CommandType(str, enum.Enum):  # what the terminal is asked to do
     enrol = "enrol"  # capture a finger into slot_number for student_id
     delete_slot = "delete_slot"  # wipe slot_number from the sensor (POPIA deletion)
+    face_enrol = "face_enrol"  # FACE: take a picture and store the student's face template
+    face_verify = "face_verify"  # FACE: take a picture and compare it with the stored template
 
 
 class CommandStatus(str, enum.Enum):  # life cycle of a terminal command
@@ -161,3 +163,12 @@ class DeviceCommand(Base):  # work queued for a terminal (enrol a finger / wipe 
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # when the terminal picked it up
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # when it finished (done/failed/cancelled/expired)
     result_detail: Mapped[str | None] = mapped_column(String(255))  # terminal error text or cancel reason
+    session_id: Mapped[int | None] = mapped_column(ForeignKey("sessions.id", ondelete="SET NULL"))  # FACE: session to mark present after a lecturer's face verify
+
+
+class FaceTemplate(Base):  # FACE: one face template (128 numbers from SFace) per student; the picture itself is never stored
+    __tablename__ = "face_templates"  # table name
+    id: Mapped[int] = mapped_column(primary_key=True)  # primary key
+    student_id: Mapped[int] = mapped_column(ForeignKey("students.id", ondelete="CASCADE"), unique=True)  # one template per student; deleted with the student
+    embedding: Mapped[bytes] = mapped_column(LargeBinary)  # 128 float32 values = 512 bytes
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())  # when enrolled

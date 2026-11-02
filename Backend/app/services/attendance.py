@@ -14,6 +14,7 @@ from app.schemas.lecturer import CourseReport, ReportRow, RosterEntry  # respons
 from app.services.access import can_access_course  # D5 visibility rule
 from app.services.audit import write_audit  # audit trail
 from app.services.views import course_outs  # course header for reports
+from app.services.face import face_counts  # which students have a face on file
 
 CSV_COLUMNS = ["student_number", "full_name", "status", "method", "recorded_at", "device_time", "note", "revoked_reason"]  # export header
 
@@ -45,6 +46,7 @@ def _entry(student: Student, row: Attendance | None, names: dict[int, str]) -> R
         recorded_at=row.recorded_at,  # server time
         device_time=row.device_time,  # terminal time
         fp_confidence=row.fp_confidence,  # match score
+        face_score=row.face_score,  # face similarity (face method only)
         note=row.note,  # manual reason
         revoked_at=row.revoked_at,  # revocation time
         revoke_reason=row.revoke_reason,  # why
@@ -57,13 +59,14 @@ def roster_entries(db: Session, session: LectureSession) -> list[RosterEntry]:  
     rows = {a.student_id: a for a in db.scalars(select(Attendance).where(Attendance.session_id == session.id))}  # student_id -> record
     user_ids = {a.recorded_by_user_id for a in rows.values() if a.recorded_by_user_id}  # lecturers to name
     names = dict(db.execute(select(User.id, User.full_name).where(User.id.in_(user_ids))).tuples().all()) if user_ids else {}  # id -> name
-    return [_entry(s, rows.get(s.id), names) for s in students]  # build lines
+    faces = face_counts(db, [s.id for s in students])  # student_id -> face templates (one query)
+    return [_entry(s, rows.get(s.id), names).model_copy(update={"face_enrolled": faces.get(s.id, 0) > 0}) for s in students]  # build lines
 
 
 def entry_for(db: Session, row: Attendance) -> RosterEntry:  # roster line for one record
     student = db.get(Student, row.student_id)  # whose record
     names = dict(db.execute(select(User.id, User.full_name).where(User.id == row.recorded_by_user_id)).tuples().all()) if row.recorded_by_user_id else {}  # lecturer name
-    return _entry(student, row, names)  # build the line
+    return _entry(student, row, names).model_copy(update={"face_enrolled": face_counts(db, [student.id]).get(student.id, 0) > 0})  # build the line
 
 
 def manual_mark(db: Session, *, session: LectureSession, student_number: str, reason: str, user: User) -> Attendance:  # lecturer marks a student present (POPIA fallback)

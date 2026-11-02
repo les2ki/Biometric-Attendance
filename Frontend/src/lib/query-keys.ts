@@ -24,4 +24,8 @@ export const qk = { // every query key in one place
   adminDeviceCommands: (id: number, f: object) => ["admin", "device-commands", id, f] as const, // command history
   adminDeviceCommandsAll: ["admin", "device-commands"] as const, // prefix for command histories
   adminAudit: (f: object) => ["admin", "audit", f] as const, // audit log
+
+  // ---- face (Milestone C) ----
+  adminFace: (studentId: number) => ["admin", "face", studentId] as const, // face card on the student page
+  faceCommand: (id: number) => ["face", "command", id] as const, // one face job (polled while the terminal works)
 };

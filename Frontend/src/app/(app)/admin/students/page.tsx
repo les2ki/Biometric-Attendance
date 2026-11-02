@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react"; // React
 import { useRouter } from "next/navigation"; // row navigation
-import { GraduationCap, UserPlus } from "lucide-react"; // icons
+import { GraduationCap, ScanFace, UserPlus } from "lucide-react"; // icons
 import { Button } from "@/components/ui/button"; // actions
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"; // filters
 import { ActiveBadge } from "@/components/admin/active-badge"; // status pill
@@ -36,6 +36,7 @@ export default function AdminStudentsPage() { // /admin/students (WP-A4)
     { key: "number", header: "Student number", cell: (s) => <span className="tabular font-mono text-sm text-ink-2">{s.student_number}</span> }, // monospace
     { key: "name", header: "Name", cell: (s) => <span className="font-medium text-ink">{s.full_name}</span> }, // name
     { key: "consent", header: "Consent", cell: (s) => <ConsentBadge consent={s.biometric_consent} /> }, // POPIA
+    { key: "face", header: "Face", cell: (s) => (s.face_samples > 0 ? <span className="inline-flex h-6 items-center gap-1.5 rounded-md border border-rule px-2 text-xs font-medium whitespace-nowrap text-ink-2"><ScanFace className="size-3.5 text-muted-foreground" aria-hidden />Enrolled · {s.face_samples}</span> : <span className="text-sm text-muted-foreground">No face</span>) }, // face templates
     { key: "fp", header: "Fingerprint", cell: (s) => s.enrolled_device_ids.length === 0 ? <span className="text-sm text-muted-foreground">Not enrolled</span> : ( // terminal chips
       <span className="flex flex-wrap gap-1">{s.enrolled_device_ids.map((id) => <span key={id} className="inline-flex h-6 items-center rounded-md border border-rule px-2 font-mono text-xs text-ink-2">{deviceNames.get(id) ?? `#${id}`}</span>)}</span>
     ) },

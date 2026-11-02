@@ -1,502 +1,623 @@
-// terminal.ino - BSAVS main terminal firmware (ESP32-WROOM-32 + DY50 fingerprint + 16x2 LCD + LEDs + buzzer)
-// What it does:
-//   1. Joins Wi-Fi, sets its clock from the internet (NTP), and talks to the BSAVS server over HTTPS.
-//   2. Signs every request with HMAC-SHA256 using the device secret (the server rejects anything unsigned).
-//   3. Asks the server which session is open, then sends every fingerprint match as an attendance event.
-//   4. Polls the server for jobs from the admin dashboard: "enrol a finger into slot N" and "delete slot N".
-//   5. If Wi-Fi or the server is down, saves scans in flash (LittleFS) and sends them later (offline queue).
-// Libraries (Arduino IDE > Library Manager): "Adafruit Fingerprint Sensor Library", "ArduinoJson" (by Benoit Blanchon).
-// Board: "ESP32 Dev Module". Works with ESP32 board package 2.0.17 and 3.x. Serial Monitor: 115200, "Newline".
-// Before uploading: copy secrets.example.h to secrets.h (same folder) and fill it in. Never commit secrets.h.
-// Serial commands (for the technician): i = sensor info, s = status, q = show queue size, x = wipe ALL fingerprints (asks YES)
+// terminal.ino - main ESP32 (30-pin) of the Biometric Student Attendance and Verification System terminal
+// Talks to the backend with HMAC-signed requests (same signing as Backend/app/security.py and scripts/fake_terminal.py):
+//   GET  /device/session                  which lecture session is open on this terminal (every 30 s)
+//   POST /device/attendance               one fingerprint scan (offline scans are queued in flash and sent later)
+//   GET  /device/commands/next            work queued from the dashboard (every 3 s)
+//   POST /device/commands/{id}/result     how that work went
+//   POST /device/commands/{id}/face       raw 320x240 greyscale picture for face_enrol / face_verify (NEW - backend must add it)
+// Command types handled: enrol (finger into a slot), delete_slot (POPIA wipe),
+//   face_enrol (admin) and face_verify (admin or lecturer): ask the camera ESP32 for a picture, upload it, report the result.
+// Wiring: DY50 TX(green)->GPIO16, RX(white)<-GPIO17, VCC->VIN, GND
+//         LCD RS->23, E->19, D4->18, D5->4, D6->32, D7->13, RW->GND, V0->pot wiper
+//         LEDs (220 ohm): green GPIO25, yellow GPIO26, red GPIO27. Buzzer: GPIO33 -> 1k -> NPN base
+//         Camera ESP32 link: GPIO21 TX1 -> camera GPIO16, GPIO22 RX1 <- camera GPIO17, shared GND
+// Libraries (Library Manager): "Adafruit Fingerprint Sensor Library", "ArduinoJson" (v7), "LiquidCrystal"
+// Arduino IDE: board "ESP32 Dev Module", PSRAM "Disabled". Fill in secrets.h first.
 
-#include <WiFi.h>                 // Wi-Fi station mode
-#include <WiFiClientSecure.h>     // TLS (HTTPS) socket
-#include <HTTPClient.h>           // simple HTTP requests on top of the TLS socket
-#include <ArduinoJson.h>          // read the server's JSON replies
-#include <Adafruit_Fingerprint.h> // DY50 / R307 / FPM10A driver
-#include <LiquidCrystal.h>        // 16x2 LCD (HD44780) in 4-bit mode
-#include <LittleFS.h>             // small file system in flash, for the offline queue
-#include <time.h>                 // NTP clock and time formatting
-#include "mbedtls/md.h"           // HMAC-SHA256 (built into the ESP32 core)
-#include "secrets.h"              // WIFI_SSID, WIFI_PASS, API_HOST, DEVICE_ID, DEVICE_SECRET (not in Git)
+#include <WiFi.h>                  // Wi-Fi
+#include <HTTPClient.h>            // HTTP requests
+#include <WiFiClientSecure.h>      // HTTPS
+#include <Preferences.h>           // flash storage for the offline queue
+#include <ArduinoJson.h>           // build and read JSON
+#include <Adafruit_Fingerprint.h>  // DY50 driver
+#include <LiquidCrystal.h>         // HD44780 LCD
+#include <time.h>                  // clock from NTP
+#include "mbedtls/md.h"            // HMAC-SHA256
+#include "secrets.h"               // Wi-Fi, server and device secret
 
-// ---------------- pins (same as the wiring page / veroboard) ----------------
-const int FP_RX_PIN = 16;         // ESP32 RX2 <- DY50 TX (green)
-const int FP_TX_PIN = 17;         // ESP32 TX2 -> DY50 RX (white)
-const int LCD_RS = 23, LCD_E = 19, LCD_D4 = 18, LCD_D5 = 4, LCD_D6 = 32, LCD_D7 = 13;  // LCD pins 4, 6, 11-14
-const int LED_GREEN = 25;         // green LED through 220 ohm
-const int LED_YELLOW = 26;        // yellow LED through 220 ohm
-const int LED_RED = 27;           // red LED through 220 ohm
-const int BUZZER_PIN = 33;        // buzzer (through 100 ohm, or through the NPN transistor)
-#define BUZZER_IS_PASSIVE 0       // 0 = active buzzer (beeps on its own from DC). 1 = passive buzzer (needs a tone)
+// ---------- pins ----------
+const int FP_RX_PIN = 16;   // UART2 RX <- sensor TX (green)
+const int FP_TX_PIN = 17;   // UART2 TX -> sensor RX (white)
+const int CAM_RX_PIN = 22;  // UART1 RX <- camera ESP32 TX2 (GPIO17)
+const int CAM_TX_PIN = 21;  // UART1 TX -> camera ESP32 RX2 (GPIO16)
+const int LCD_RS = 23;      // LCD pin 4
+const int LCD_E  = 19;      // LCD pin 6
+const int LCD_D4 = 18;      // LCD pin 11
+const int LCD_D5 = 4;       // LCD pin 12
+const int LCD_D6 = 32;      // LCD pin 13
+const int LCD_D7 = 13;      // LCD pin 14
+const int LED_GREEN = 25;   // recorded / success
+const int LED_YELLOW = 26;  // busy, offline, or "ask the lecturer"
+const int LED_RED = 27;     // rejected / error
+const int BUZZER = 33;      // through the NPN transistor
 
-// ---------------- timing ----------------
-const uint32_t FP_BAUD = 57600;               // DY50 default speed
-const unsigned long SESSION_POLL_MS = 15000;  // ask "which session is open?" every 15 s
-const unsigned long COMMAND_POLL_MS = 5000;   // ask "any enrol/delete jobs?" every 5 s
-const unsigned long QUEUE_FLUSH_MS = 20000;   // try to send saved offline scans every 20 s
-const unsigned long WIFI_RETRY_MS = 10000;    // reconnect attempt interval when Wi-Fi drops
-const unsigned long RESULT_SHOW_MS = 2500;    // how long a result stays on the screen
-const uint16_t FINGER_TIMEOUT_MS = 15000;     // max wait for a finger during enrolment
-const uint16_t HTTP_TIMEOUT_MS = 60000;       // the free server can take up to ~1 min to wake up
-const int QUEUE_MAX = 500;                    // design requirement: at least 500 offline events
-const char *QUEUE_FILE = "/queue.txt";        // one JSON attendance event per line
-const char *QUEUE_TMP = "/queue.tmp";         // used while rewriting the queue
+// ---------- settings ----------
+const uint32_t FP_BAUD = 57600;              // sensor default
+const uint32_t CAM_BAUD = 921600;            // must match the camera sketch
+const uint16_t FINGER_TIMEOUT_MS = 15000;    // wait for a finger during enrolment prompts
+const unsigned long RESULT_SHOW_MS = 2500;   // how long a result stays on the LCD
+const unsigned long COMMAND_POLL_MS = 3000;  // how often to ask for dashboard work
+const unsigned long SESSION_POLL_MS = 30000; // how often to re-check the open session
+const unsigned long QUEUE_FLUSH_MS = 10000;  // how often to retry offline scans
+const unsigned long WIFI_RETRY_MS = 15000;   // how often to retry Wi-Fi when it drops
+const uint16_t HTTP_TIMEOUT_MS = 15000;      // per request (picture uploads take a few seconds)
+const unsigned long CAMERA_TIMEOUT_MS = 8000;// 3 camera attempts + ~1 s transfer
+const int FACE_TRIES = 3;                    // pictures per face command before giving up
+const int FRAME_W = 320, FRAME_H = 240;      // picture size from the camera
+const uint32_t FRAME_LEN = FRAME_W * FRAME_H; // 76 800 bytes
+const int QUEUE_MAX = 40;                    // offline scans kept in flash
 
-// ---------------- hardware objects ----------------
-HardwareSerial fingerSerial(2);                                  // UART2 for the sensor
-Adafruit_Fingerprint finger(&fingerSerial);                      // sensor driver
-LiquidCrystal lcd(LCD_RS, LCD_E, LCD_D4, LCD_D5, LCD_D6, LCD_D7); // LCD driver
-WiFiClientSecure tls;                                            // one TLS connection, reused between requests
-HTTPClient http;                                                 // one HTTP client, reused between requests
+// ---------- objects ----------
+HardwareSerial fingerSerial(2);                                   // UART2 for the sensor
+HardwareSerial camSerial(1);                                      // UART1 for the camera ESP32
+Adafruit_Fingerprint finger(&fingerSerial);                       // sensor driver
+LiquidCrystal lcd(LCD_RS, LCD_E, LCD_D4, LCD_D5, LCD_D6, LCD_D7); // LCD, 4-bit write-only
+Preferences queueStore;                                           // flash namespace for the offline queue
+WiFiClientSecure secureClient;                                    // one TLS connection, reused between requests
+WiFiClient plainClient;                                           // for http:// during local testing
+uint8_t *frame = nullptr;                                         // picture buffer, allocated once at start-up
 
-// ---------------- state ----------------
-int sessionId = 0;                // open session for this terminal (0 = none)
-String courseCode = "";           // shown on the idle screen
-bool serverReachable = false;     // last request reached the server
-int queueCount = 0;               // events waiting in the offline queue
-unsigned long nextSessionPoll = 0, nextCommandPoll = 0, nextQueueFlush = 0, nextWifiRetry = 0;  // schedule
+// ---------- state ----------
+bool fingerOk = false;        // sensor answered at start-up
+bool cameraOk = false;        // camera ESP32 answered PONG OK
+bool clockOk = false;         // NTP time is set (needed for signatures)
+bool sessionOpen = false;     // a lecture session is open on this terminal
+int sessionId = 0;            // id from GET /device/session
+String sessionCourse = "";    // course code for the LCD
+String sessionVenue = "";     // venue for the LCD
+unsigned long nextCommandPoll = 0;  // millis() of the next command poll
+unsigned long nextSessionPoll = 0;  // millis() of the next session check
+unsigned long nextQueueFlush = 0;   // millis() of the next offline-queue retry
+unsigned long nextWifiRetry = 0;    // millis() of the next Wi-Fi retry
+String idleShown = "";              // which idle screen is showing (avoids redrawing every loop)
 
-// ArduinoJson 6 and 7 name their document type differently; this macro works with both
-#if ARDUINOJSON_VERSION_MAJOR >= 7
-#define JSON_DOC(name) JsonDocument name
-#else
-#define JSON_DOC(name) DynamicJsonDocument name(1024)
-#endif
+// ---------- LCD with scrolling (from fingerprint_lcd_test.ino) ----------
+const int LCD_COLS = 16;                         // characters per line
+const unsigned long SCROLL_STEP_MS = 350;        // time between scroll steps
+const unsigned long SCROLL_START_DELAY_MS = 1000;// pause before a long line scrolls
+const char *SCROLL_GAP = "    ";                 // gap between a message and its repeat
+String lcdLine[2];                               // full text of each line
+int lcdOffset[2] = {0, 0};                       // scroll position of each line
+unsigned long lcdNextScroll = 0;                 // millis() of the next scroll step
 
-// =====================================================================
-// LCD with scrolling (same behaviour as fingerprint_lcd_test)
-// =====================================================================
-const int LCD_COLS = 16;                      // characters per line
-const unsigned long SCROLL_STEP_MS = 350;     // scroll speed
-const unsigned long SCROLL_START_DELAY_MS = 1000;  // pause before a long line starts moving
-const char *SCROLL_GAP = "    ";              // gap between the end of a message and its repeat
-String lcdLine[2];                            // full text of each line
-int lcdOffset[2] = {0, 0};                    // scroll position of each line
-unsigned long lcdNextScroll = 0;              // when to scroll next
-
-void lcdDrawLine(int row) {  // prints the visible 16 characters of one line
-  String text = lcdLine[row], window = "";   // full text and the part we print
-  if ((int)text.length() <= LCD_COLS) window = text;  // short: print as is
-  else {                                      // long: moving window over text + gap
-    String loopText = text + SCROLL_GAP;      // add the gap
+void lcdDrawLine(int row) {  // draw the visible 16 characters of one line
+  String text = lcdLine[row];  // full message
+  String window = "";  // what gets printed
+  if ((int)text.length() <= LCD_COLS) {  // fits
+    window = text;  // as is
+  } else {  // too long: moving window
+    String loopText = text + SCROLL_GAP;  // message plus gap
     for (int i = 0; i < LCD_COLS; i++) window += loopText.charAt((lcdOffset[row] + i) % loopText.length());  // 16 chars from the offset
   }
-  while ((int)window.length() < LCD_COLS) window += ' ';  // pad to overwrite old text
-  lcd.setCursor(0, row);                      // start of the row
-  lcd.print(window);                          // print it
+  while ((int)window.length() < LCD_COLS) window += ' ';  // pad to clear old text
+  lcd.setCursor(0, row);  // start of the row
+  lcd.print(window);  // print it
 }
 
-void lcdShow(const String &l1, const String &l2) {  // sets both lines (long lines scroll by themselves)
-  if (l1 == lcdLine[0] && l2 == lcdLine[1]) return;  // same text already showing: don't flicker
-  lcdLine[0] = l1; lcdLine[1] = l2;           // remember the text
-  lcdOffset[0] = lcdOffset[1] = 0;            // start from the beginning
-  lcdNextScroll = millis() + SCROLL_START_DELAY_MS;  // short pause before scrolling
-  lcd.clear();                                // wipe the screen
-  lcdDrawLine(0); lcdDrawLine(1);             // draw both lines
+void lcdShow(const String &line1, const String &line2) {  // set both lines (long ones scroll)
+  lcdLine[0] = line1;  // top
+  lcdLine[1] = line2;  // bottom
+  lcdOffset[0] = 0;  // from the start
+  lcdOffset[1] = 0;  // from the start
+  lcdNextScroll = millis() + SCROLL_START_DELAY_MS;  // pause before scrolling
+  lcd.clear();  // wipe
+  lcdDrawLine(0);  // draw top
+  lcdDrawLine(1);  // draw bottom
+  idleShown = "";  // the idle screen must be redrawn later
 }
 
 void lcdTick() {  // call often: scrolls long lines
   if ((long)(millis() - lcdNextScroll) < 0) return;  // not yet
-  lcdNextScroll = millis() + SCROLL_STEP_MS;  // schedule the next step
-  for (int row = 0; row < 2; row++) {         // both rows
-    int len = lcdLine[row].length();          // message length
-    if (len <= LCD_COLS) continue;            // short lines don't scroll
-    lcdOffset[row] = (lcdOffset[row] + 1) % (len + strlen(SCROLL_GAP));  // one step, wrapping
-    lcdDrawLine(row);                         // redraw
+  lcdNextScroll = millis() + SCROLL_STEP_MS;  // next step
+  for (int row = 0; row < 2; row++) {  // both lines
+    int len = lcdLine[row].length();  // length
+    if (len <= LCD_COLS) continue;  // short lines stay still
+    lcdOffset[row] = (lcdOffset[row] + 1) % (len + strlen(SCROLL_GAP));  // one step
+    lcdDrawLine(row);  // redraw
   }
 }
 
-void lcdWait(unsigned long ms) {  // like delay(), but keeps the LCD scrolling
-  unsigned long start = millis();             // start time
-  while (millis() - start < ms) { lcdTick(); delay(20); }  // wait
+void lcdWait(unsigned long minMs) {  // wait, keep scrolling, long enough to read the message once
+  int longest = max(lcdLine[0].length(), lcdLine[1].length());  // longest line
+  unsigned long readMs = SCROLL_START_DELAY_MS;  // time to read it all
+  if (longest > LCD_COLS) readMs += (unsigned long)(longest - LCD_COLS + 2) * SCROLL_STEP_MS;  // time to scroll to the end
+  unsigned long waitMs = max(minMs, readMs);  // never shorter than asked
+  unsigned long start = millis();  // start
+  while (millis() - start < waitMs) { lcdTick(); delay(20); }  // wait
 }
 
-// =====================================================================
-// LEDs and buzzer
-// =====================================================================
-void setLed(char c) {  // 'g' green, 'y' yellow, 'r' red, anything else = all off
-  digitalWrite(LED_GREEN, c == 'g' ? HIGH : LOW);   // green
-  digitalWrite(LED_YELLOW, c == 'y' ? HIGH : LOW);  // yellow
-  digitalWrite(LED_RED, c == 'r' ? HIGH : LOW);     // red
+// ---------- LEDs and buzzer ----------
+void leds(bool g, bool y, bool r) {  // set all three LEDs
+  digitalWrite(LED_GREEN, g);  // green
+  digitalWrite(LED_YELLOW, y);  // yellow
+  digitalWrite(LED_RED, r);  // red
 }
 
-void beep(int count, int onMs) {  // count beeps of onMs each, 120 ms apart
-  for (int i = 0; i < count; i++) {           // each beep
-#if BUZZER_IS_PASSIVE
-    tone(BUZZER_PIN, 2700, onMs);             // passive buzzer: play a 2.7 kHz tone
-    delay(onMs);                              // wait while it plays
-#else
-    digitalWrite(BUZZER_PIN, HIGH);           // active buzzer: on
-    delay(onMs);                              // beep length
-    digitalWrite(BUZZER_PIN, LOW);            // off
-#endif
-    if (i < count - 1) delay(120);            // gap between beeps
+void beep(int count, int onMs, int offMs) {  // short buzzer pattern
+  for (int i = 0; i < count; i++) {  // each beep
+    digitalWrite(BUZZER, HIGH);  // on
+    delay(onMs);  // length
+    digitalWrite(BUZZER, LOW);  // off
+    if (i < count - 1) delay(offMs);  // gap
   }
 }
 
-void feedback(char led, int beeps, int beepMs, const String &l1, const String &l2) {  // one call = LCD + LED + sound
-  lcdShow(l1, l2);                            // message
-  setLed(led);                                // light
-  if (beeps > 0) beep(beeps, beepMs);         // sound
+void feedback(char kind, const String &line1, const String &line2) {  // result screen: 'g' success, 'y' warning, 'r' error
+  leds(kind == 'g', kind == 'y', kind == 'r');  // matching LED
+  lcdShow(line1, line2);  // message
+  if (kind == 'g') beep(1, 120, 0);  // one short beep
+  else if (kind == 'y') beep(2, 80, 80);  // two quick beeps
+  else beep(1, 600, 0);  // one long beep
+  lcdWait(RESULT_SHOW_MS);  // let it be read
+  leds(false, false, false);  // LEDs off
 }
 
-// =====================================================================
-// time, random strings, HMAC
-// =====================================================================
-bool clockValid() { return time(nullptr) > 1700000000; }  // true once NTP has set the clock (after Nov 2023)
-
-String isoUtcNow() {  // current time as 2026-11-03T09:07:12Z (the server needs the timezone)
-  time_t now = time(nullptr);                 // seconds since 1970
-  struct tm t; gmtime_r(&now, &t);            // split into date/time (UTC)
-  char buf[24]; strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &t);  // format
-  return String(buf);                         // done
+// ---------- clock and signatures ----------
+void syncClock() {  // get UTC time from the internet (needed for X-Timestamp)
+  configTime(0, 0, "pool.ntp.org", "time.google.com");  // UTC, two servers
+  for (int i = 0; i < 20 && time(nullptr) < 1700000000; i++) delay(500);  // wait up to 10 s
+  clockOk = time(nullptr) >= 1700000000;  // set once the year is sensible
+  Serial.println(clockOk ? "Clock set from NTP" : "Clock NOT set (signatures will fail)");  // log
 }
 
-String randomHex(int bytes) {  // hardware random number as hex (bytes*2 characters)
-  String s = "";                              // result
-  for (int i = 0; i < bytes; i++) {           // each byte
-    uint8_t b = esp_random() & 0xFF;          // true random byte from the ESP32 radio
-    if (b < 16) s += '0';                     // leading zero
-    s += String(b, HEX);                      // two hex digits
+String isoNow() {  // current UTC time as 2026-11-02T10:15:30+00:00
+  time_t t = time(nullptr);  // seconds since 1970
+  struct tm utc;  // broken-down time
+  gmtime_r(&t, &utc);  // to UTC fields
+  char buf[32];  // text buffer
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S+00:00", &utc);  // ISO 8601 with timezone (the server needs one)
+  return String(buf);  // done
+}
+
+String randomHex(int bytes) {  // random hex string (nonces and idempotency keys)
+  String out = "";  // result
+  for (int i = 0; i < bytes; i++) {  // each byte
+    uint8_t b = esp_random() & 0xFF;  // hardware random
+    if (b < 16) out += '0';  // leading zero
+    out += String(b, HEX);  // two hex digits
   }
-  return s;                                   // e.g. 32 characters for 16 bytes
+  return out;  // e.g. 32 hex chars for 16 bytes
 }
 
-String hmacSha256Hex(const String &message) {  // HMAC-SHA256(DEVICE_SECRET, message) as lowercase hex
-  uint8_t out[32];                            // 256-bit result
-  mbedtls_md_context_t ctx;                   // hashing context
-  mbedtls_md_init(&ctx);                      // prepare it
-  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);  // SHA-256 in HMAC mode
-  mbedtls_md_hmac_starts(&ctx, (const unsigned char *)DEVICE_SECRET, strlen(DEVICE_SECRET));  // the secret key
-  mbedtls_md_hmac_update(&ctx, (const unsigned char *)message.c_str(), message.length());     // the message
-  mbedtls_md_hmac_finish(&ctx, out);          // compute
-  mbedtls_md_free(&ctx);                      // clean up
-  String hex = "";                            // convert to hex text
-  for (int i = 0; i < 32; i++) { if (out[i] < 16) hex += '0'; hex += String(out[i], HEX); }  // 64 characters
-  return hex;                                 // signature
+String signRequest(const String &method, const String &path, uint32_t ts, const String &nonce, const uint8_t *body, size_t len) {  // same as compute_signature() in security.py
+  String head = method + "\n" + path + "\n" + String(ts) + "\n" + nonce + "\n";  // method, path, timestamp, nonce, each followed by a newline
+  uint8_t mac[32];  // HMAC-SHA256 output
+  mbedtls_md_context_t ctx;  // hashing context
+  mbedtls_md_init(&ctx);  // reset
+  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);  // SHA-256, HMAC mode
+  mbedtls_md_hmac_starts(&ctx, (const unsigned char *)DEVICE_SECRET, strlen(DEVICE_SECRET));  // key = device secret
+  mbedtls_md_hmac_update(&ctx, (const unsigned char *)head.c_str(), head.length());  // the header part
+  if (len) mbedtls_md_hmac_update(&ctx, body, len);  // then the exact body bytes
+  mbedtls_md_hmac_finish(&ctx, mac);  // result
+  mbedtls_md_free(&ctx);  // clean up
+  String hex = "";  // lowercase hex
+  for (int i = 0; i < 32; i++) { if (mac[i] < 16) hex += '0'; hex += String(mac[i], HEX); }  // 64 hex chars
+  return hex;  // signature
 }
 
-// =====================================================================
-// signed request to the server
-// =====================================================================
-struct ApiResult { int code; String body; };  // HTTP status (negative = never reached the server) + reply text
+// ---------- HTTP ----------
+struct ApiResponse {  // what came back
+  int code;     // HTTP status, or negative for a network failure
+  String body;  // response text
+};
 
-ApiResult api(const char *method, const String &path, const String &body) {  // sends one signed request
-  if (WiFi.status() != WL_CONNECTED) return {-1, ""};  // no Wi-Fi
-  if (!clockValid()) return {-2, ""};          // can't sign without the right time (server allows 5 min drift)
-  String ts = String((long)time(nullptr));     // X-Timestamp: Unix seconds
-  String nonce = randomHex(16);                // X-Nonce: 32 random hex characters, never reused
-  String toSign = String(method) + "\n" + path + "\n" + ts + "\n" + nonce + "\n" + body;  // exactly what the server rebuilds
-  String sig = hmacSha256Hex(toSign);          // X-Signature
-  http.begin(tls, String("https://") + API_HOST + path);  // URL (reuses the open TLS connection when possible)
-  http.setTimeout(HTTP_TIMEOUT_MS);            // wait for slow (waking) server
-  http.addHeader("X-Device-Id", String(DEVICE_ID));  // which terminal
-  http.addHeader("X-Timestamp", ts);           // when signed
-  http.addHeader("X-Nonce", nonce);            // single-use random
-  http.addHeader("X-Signature", sig);          // proof we know the secret
-  int code;                                    // HTTP status
-  if (strcmp(method, "GET") == 0) code = http.GET();  // GET has no body
-  else { http.addHeader("Content-Type", "application/json"); code = http.POST(body); }  // POST with JSON body
-  String reply = code > 0 ? http.getString() : "";  // reply text (empty on failure)
-  http.end();                                  // finish (connection stays open for reuse)
-  serverReachable = code > 0 && code < 500;    // 5xx / no answer = server not usable right now
-  Serial.printf("%s %s -> %d %s\n", method, path.c_str(), code, reply.substring(0, 120).c_str());  // log for debugging
-  return {code, reply};                        // result
+ApiResponse api(const char *method, const String &path, const uint8_t *body, size_t len, const char *contentType) {  // one signed request
+  ApiResponse res = {-1, ""};  // assume failure
+  if (WiFi.status() != WL_CONNECTED) return res;  // offline
+  if (!clockOk) syncClock();  // signatures need the time
+  if (!clockOk) return res;  // still no clock
+  uint32_t ts = (uint32_t)time(nullptr);  // X-Timestamp
+  String nonce = randomHex(16);  // X-Nonce, 32 hex chars, single use
+  String sig = signRequest(method, path, ts, nonce, body, len);  // X-Signature
+  String url = String(API_BASE_URL) + path;  // full address
+  HTTPClient http;  // request object
+  http.setReuse(true);  // keep the connection open between requests (saves a TLS handshake each poll)
+  http.setTimeout(HTTP_TIMEOUT_MS);  // give up after this
+  bool started = url.startsWith("https") ? http.begin(secureClient, url) : http.begin(plainClient, url);  // HTTPS or plain HTTP
+  if (!started) return res;  // bad URL
+  http.addHeader("X-Device-Id", String(DEVICE_ID));  // who we are
+  http.addHeader("X-Timestamp", String(ts));  // when
+  http.addHeader("X-Nonce", nonce);  // single-use random
+  http.addHeader("X-Signature", sig);  // proof we know the secret
+  if (contentType) http.addHeader("Content-Type", contentType);  // body type
+  res.code = http.sendRequest(method, (uint8_t *)body, len);  // send exactly the signed bytes
+  if (res.code > 0) res.body = http.getString();  // read the answer
+  http.end();  // done (connection kept for reuse)
+  Serial.printf("%s %s -> %d %s\n", method, path.c_str(), res.code, res.body.substring(0, 120).c_str());  // log
+  return res;  // to the caller
 }
 
-String jsonString(const String &body, const char *key) {  // reads one text field from a JSON reply ("" if missing)
-  JSON_DOC(doc);                               // JSON document
-  if (deserializeJson(doc, body)) return "";   // not JSON
-  return doc[key] | "";                        // the field, or ""
+ApiResponse apiJson(const char *method, const String &path, const String &json) {  // signed request with a JSON body
+  return api(method, path, (const uint8_t *)json.c_str(), json.length(), "application/json");  // body as bytes
 }
 
-// =====================================================================
-// session
-// =====================================================================
-void pollSession() {  // asks the server which session is open on this terminal
-  ApiResult r = api("GET", "/device/session", "");  // signed GET
-  if (r.code == 200) {                         // a session is open
-    JSON_DOC(doc);                             // parse
-    if (!deserializeJson(doc, r.body)) {       // valid JSON
-      sessionId = doc["session_id"] | 0;       // remember the session
-      courseCode = String((const char *)(doc["course_code"] | ""));  // for the screen
+String errorDetail(const ApiResponse &r) {  // FastAPI errors look like {"detail": "unknown_slot"}
+  JsonDocument doc;  // parsed body
+  if (deserializeJson(doc, r.body)) return "";  // not JSON
+  return String(doc["detail"] | "");  // the reason, or empty
+}
+
+// ---------- session ----------
+void refreshSession() {  // ask which session is open on this terminal
+  ApiResponse r = api("GET", "/device/session", nullptr, 0, nullptr);  // no body
+  if (r.code == 200) {  // a session is open
+    JsonDocument doc;  // parsed body
+    if (deserializeJson(doc, r.body)) return;  // garbled, keep what we had
+    sessionOpen = true;  // remember
+    sessionId = doc["session_id"] | 0;  // id sent with every scan
+    sessionCourse = String(doc["course_code"] | "");  // for the LCD
+    sessionVenue = String(doc["venue"] | "");  // for the LCD
+  } else if (r.code == 404) {  // no_open_session
+    sessionOpen = false;  // stop taking scans
+  } else if (r.code == 401) {  // signature rejected
+    Serial.println("Session check rejected: " + errorDetail(r));  // usually clock or secret
+  }  // network errors: keep the last known session so scans can be queued offline
+}
+
+void showIdle() {  // waiting screen, redrawn only when it changes
+  String want;  // which screen
+  if (WiFi.status() != WL_CONNECTED && !sessionOpen) want = "offline";  // no network, no session
+  else if (!sessionOpen) want = "nosession";  // waiting for a lecturer
+  else want = "session" + String(sessionId) + (WiFi.status() == WL_CONNECTED ? "" : "off");  // taking scans
+  if (want == idleShown) return;  // already showing
+  if (want == "offline") lcdShow("Offline", "Connecting to Wi-Fi...");  // no network
+  else if (want == "nosession") lcdShow("No session open", "Waiting for the lecturer to open a session");  // idle
+  else lcdShow(sessionCourse + " " + sessionVenue, WiFi.status() == WL_CONNECTED ? "Place your finger" : "Offline: place finger, saved for later");  // ready
+  digitalWrite(LED_YELLOW, WiFi.status() != WL_CONNECTED);  // yellow while offline
+  idleShown = want;  // remember
+}
+
+// ---------- offline queue (flash) ----------
+int queueHead() { return queueStore.getInt("head", 0); }    // index of the oldest entry
+int queueCount() { return queueStore.getInt("count", 0); }  // entries waiting
+
+bool queuePush(const String &json) {  // keep a scan for later
+  int count = queueCount();  // how many waiting
+  if (count >= QUEUE_MAX) return false;  // full
+  int slot = (queueHead() + count) % QUEUE_MAX;  // next free position (ring)
+  queueStore.putString(("q" + String(slot)).c_str(), json);  // save the exact body (same idempotency key on resend)
+  queueStore.putInt("count", count + 1);  // one more
+  return true;  // saved
+}
+
+void queuePop() {  // drop the oldest entry
+  int count = queueCount();  // how many
+  if (count == 0) return;  // nothing
+  queueStore.remove(("q" + String(queueHead())).c_str());  // delete it
+  queueStore.putInt("head", (queueHead() + 1) % QUEUE_MAX);  // advance
+  queueStore.putInt("count", count - 1);  // one fewer
+}
+
+void flushQueue() {  // send offline scans, oldest first, while the network works
+  while (queueCount() > 0 && WiFi.status() == WL_CONNECTED) {  // something waiting and online
+    String json = queueStore.getString(("q" + String(queueHead())).c_str(), "");  // oldest body
+    if (json.length() == 0) { queuePop(); continue; }  // damaged entry
+    ApiResponse r = apiJson("POST", "/device/attendance", json);  // resend (the server ignores repeats)
+    if (r.code < 0 || r.code >= 500 || r.code == 401) return;  // network, server or clock problem: try later
+    Serial.println("Synced offline scan: " + String(r.code) + " " + r.body);  // 200, or 404/409 the lecturer resolves
+    queuePop();  // done with it either way
+  }
+}
+
+// ---------- fingerprint ----------
+bool waitForFinger(uint16_t timeoutMs) {  // wait for a finger image
+  unsigned long start = millis();  // start
+  while (millis() - start < timeoutMs) {  // until timeout
+    if (finger.getImage() == FINGERPRINT_OK) return true;  // got one
+    lcdTick();  // keep scrolling
+    delay(50);  // pause
+  }
+  return false;  // none
+}
+
+void waitForRemoval() {  // wait until the finger is lifted (max 5 s)
+  unsigned long start = millis();  // start
+  while (finger.getImage() != FINGERPRINT_NOFINGER && millis() - start < 5000) { lcdTick(); delay(50); }  // still on the glass
+}
+
+void recordScan(uint16_t slot, uint16_t confidence) {  // send a match to the server and show the decision
+  JsonDocument doc;  // request body
+  doc["idempotency_key"] = randomHex(16);  // made once per scan, reused if queued
+  doc["session_id"] = sessionId;  // the open session
+  doc["slot_number"] = slot;  // matched slot
+  doc["confidence"] = confidence;  // match score
+  if (clockOk) doc["device_time"] = isoNow();  // scan time (needed if it syncs after the session closes)
+  String json;  // body text
+  serializeJson(doc, json);  // build it
+  leds(false, true, false);  // yellow while checking
+  lcdShow("Checking...", "Please wait");  // feedback
+  ApiResponse r = apiJson("POST", "/device/attendance", json);  // send
+  if (r.code == 200) {  // a decision
+    JsonDocument res;  // response
+    deserializeJson(res, r.body);  // parse
+    String status = String(res["status"] | "");  // recorded / duplicate / low_confidence / not_in_course
+    String name = String(res["full_name"] | "");  // student name
+    if (status == "recorded") feedback('g', "Present", name);  // saved
+    else if (status == "duplicate") feedback('y', "Already marked", name);  // second scan
+    else if (status == "low_confidence") feedback('y', "Not sure it's you", "Ask the lecturer to verify your face");  // fallback path
+    else if (status == "not_in_course") feedback('r', "Not in course", name + " is not on this class list");  // wrong class
+    else feedback('r', "Unknown reply", status);  // unexpected
+  } else if (r.code == 404) {  // unknown_slot or unknown_session
+    String d = errorDetail(r);  // reason
+    if (d == "unknown_session") { refreshSession(); feedback('r', "Session ended", "Scan not recorded"); }  // session changed
+    else feedback('r', "Not registered", "See the admin to enrol your fingerprint");  // finger on the sensor, not in the database
+  } else if (r.code == 409) {  // session_closed
+    refreshSession();  // update the screen
+    feedback('r', "Session closed", "Scan not recorded");  // too late
+  } else if (r.code == 401) {  // bad signature / stale time / unknown device
+    syncClock();  // the usual cause is the clock
+    feedback('r', "Terminal error", "Not authorised: " + errorDetail(r));  // show the reason
+  } else if (r.code < 0 || r.code >= 500) {  // offline or server down
+    if (queuePush(json)) feedback('y', "Saved offline", "Will sync when the network is back");  // keep it
+    else feedback('r', "Offline, queue full", "Please see the lecturer");  // no room
+  } else {  // 422 or anything else
+    feedback('r', "Error " + String(r.code), errorDetail(r));  // show it
+  }
+}
+
+void scanForFinger() {  // quick look for a finger; full flow if there is one
+  if (!fingerOk || finger.getImage() != FINGERPRINT_OK) return;  // nobody there
+  if (!sessionOpen) {  // nothing to record against
+    feedback('r', "No session open", "Wait for the lecturer to open the session");  // tell them
+    waitForRemoval();  // one message per touch
+    return;  // done
+  }
+  lcdShow("Reading...", "Hold still");  // finger detected
+  if (finger.image2Tz(1) != FINGERPRINT_OK) {  // unreadable
+    feedback('y', "Unclear print", "Press firmly with a clean, dry finger");  // retry hint
+    waitForRemoval();  // lift
+    return;  // done
+  }
+  uint8_t r = finger.fingerSearch();  // 1:N search
+  if (r == FINGERPRINT_OK) recordScan(finger.fingerID, finger.confidence);  // matched: ask the server
+  else if (r == FINGERPRINT_NOTFOUND) feedback('r', "Not recognised", "Please see your lecturer");  // not enrolled
+  else feedback('r', "Sensor error", "Try again");  // comms problem
+  waitForRemoval();  // one result per touch
+}
+
+bool enrolFinger(uint16_t slot, const String &name, String &detail) {  // capture the same finger twice into a slot
+  lcdShow("Enrol: " + name, "Place finger");  // first prompt
+  leds(false, true, false);  // yellow while enrolling
+  if (!waitForFinger(FINGER_TIMEOUT_MS)) { detail = "timeout"; return false; }  // nobody came
+  if (finger.image2Tz(1) != FINGERPRINT_OK) { detail = "unclear_print"; return false; }  // bad first image
+  lcdShow("OK", "Remove finger");  // lift
+  beep(1, 60, 0);  // tick
+  waitForRemoval();  // wait for lift
+  lcdShow("Same finger", "again please");  // second prompt
+  if (!waitForFinger(FINGER_TIMEOUT_MS)) { detail = "timeout"; return false; }  // nobody came back
+  if (finger.image2Tz(2) != FINGERPRINT_OK) { detail = "unclear_print"; return false; }  // bad second image
+  if (finger.createModel() != FINGERPRINT_OK) { detail = "prints_differ"; return false; }  // two different fingers
+  if (finger.storeModel(slot) != FINGERPRINT_OK) { detail = "store_failed"; return false; }  // slot out of range or flash error
+  waitForRemoval();  // tidy up
+  return true;  // stored
+}
+
+// ---------- camera ESP32 link ----------
+bool pingCamera() {  // "P" -> "PONG OK" means the camera board and camera are ready
+  while (camSerial.available()) camSerial.read();  // clear old bytes
+  camSerial.write('P');  // ask
+  String reply = "";  // answer text
+  unsigned long start = millis();  // start
+  while (millis() - start < 1000) {  // 1 s
+    while (camSerial.available()) reply += (char)camSerial.read();  // collect
+    if (reply.indexOf("PONG OK") >= 0) return true;  // ready
+    if (reply.indexOf("PONG NOCAM") >= 0) return false;  // board up, camera not
+    delay(10);  // wait
+  }
+  return false;  // no answer
+}
+
+bool requestPicture(String &detail) {  // "C" -> FRM1 packet into frame[], checksum verified
+  while (camSerial.available()) camSerial.read();  // drop stale bytes
+  camSerial.write('C');  // ask for a picture
+  uint8_t win[4] = {0, 0, 0, 0};  // last 4 bytes seen, to find the marker
+  unsigned long deadline = millis() + CAMERA_TIMEOUT_MS;  // give up after this
+  bool found = false;  // marker seen
+  while (millis() < deadline && !found) {  // until marker or timeout
+    if (!camSerial.available()) { delay(1); continue; }  // nothing yet
+    win[0] = win[1]; win[1] = win[2]; win[2] = win[3]; win[3] = camSerial.read();  // shift in one byte
+    if (memcmp(win, "ERR!", 4) == 0) { detail = "camera_error"; return false; }  // camera couldn't take one
+    found = memcmp(win, "FRM1", 4) == 0;  // start of a picture
+  }
+  if (!found) { detail = "camera_timeout"; return false; }  // no answer
+  camSerial.setTimeout(3000);  // per-read limit for the rest
+  uint8_t header[8];  // width, height, length
+  if (camSerial.readBytes(header, 8) != 8) { detail = "camera_short_header"; return false; }  // cut off
+  uint16_t w = header[0] | (header[1] << 8);  // width
+  uint16_t h = header[2] | (header[3] << 8);  // height
+  uint32_t len = header[4] | (header[5] << 8) | ((uint32_t)header[6] << 16) | ((uint32_t)header[7] << 24);  // pixel bytes
+  if (w != FRAME_W || h != FRAME_H || len != FRAME_LEN) { detail = "camera_bad_size"; return false; }  // not what we expect
+  if (camSerial.readBytes(frame, len) != len) { detail = "camera_short_picture"; return false; }  // cut off
+  uint8_t tail[2];  // checksum
+  if (camSerial.readBytes(tail, 2) != 2) { detail = "camera_no_checksum"; return false; }  // cut off
+  uint16_t want = tail[0] | (tail[1] << 8);  // sent checksum
+  uint16_t sum = 0;  // our checksum
+  for (uint32_t i = 0; i < len; i++) sum += frame[i];  // add every pixel
+  if (sum != want) { detail = "camera_checksum"; return false; }  // corrupted on the wire
+  return true;  // good picture in frame[]
+}
+
+// ---------- dashboard commands ----------
+void postResult(int commandId, bool success, const String &detail) {  // tell the server how a command went
+  JsonDocument doc;  // body
+  doc["success"] = success;  // done or failed
+  if (detail.length()) doc["detail"] = detail;  // reason
+  String json;  // text
+  serializeJson(doc, json);  // build
+  for (int i = 0; i < 3; i++) {  // a few tries
+    ApiResponse r = apiJson("POST", "/device/commands/" + String(commandId) + "/result", json);  // send
+    if (r.code > 0) return;  // the server got it (even a 4xx means it's been dealt with)
+    delay(1000);  // wait before retrying
+  }
+}
+
+String faceMessage(const String &status) {  // LCD text for a face result
+  if (status == "no_face") return "No face found. Look straight at the camera";  // empty picture
+  if (status == "multiple_faces") return "More than one face. Only one person please";  // crowded
+  if (status == "poor_quality") return "Picture unclear. Hold still in good light";  // blurry or dark
+  if (status == "no_match") return "Face does not match the student";  // wrong person
+  return status;  // anything else as sent
+}
+
+void runFaceCommand(int commandId, bool enrol, const String &name) {  // face_enrol / face_verify
+  String title = enrol ? "Face enrol" : "Face verify";  // LCD heading
+  if (!cameraOk) cameraOk = pingCamera();  // maybe it came up late
+  if (!cameraOk) {  // still nothing
+    feedback('r', title, "Camera not responding");  // tell the room
+    postResult(commandId, false, "camera_offline");  // tell the dashboard
+    return;  // stop
+  }
+  String detail = "";  // last failure reason
+  for (int attempt = 1; attempt <= FACE_TRIES; attempt++) {  // a few pictures if needed
+    leds(false, true, false);  // yellow: busy
+    for (int n = 3; n >= 1; n--) {  // countdown so the student is ready
+      lcdShow(title + ": " + name, "Look at the camera  " + String(n));  // prompt
+      beep(1, 40, 0);  // tick
+      delay(1000);  // one second
     }
-  } else if (r.code == 404) {                  // no open session
-    sessionId = 0; courseCode = "";            // forget the old one
-  } else if (r.code == 401) {                  // signature rejected
-    Serial.println("AUTH ERROR: check DEVICE_ID / DEVICE_SECRET in secrets.h, and that the clock is synced");  // hint
-  }                                            // other errors: keep the last known session (offline mode)
-}
-
-void showIdle() {  // the waiting screen
-  setLed(queueCount > 0 && !serverReachable ? 'y' : 0);  // yellow = scans waiting to be sent
-  if (WiFi.status() != WL_CONNECTED) lcdShow("Offline", queueCount ? String(queueCount) + " scan(s) saved, will sync" : "No Wi-Fi - scans are saved");  // no Wi-Fi
-  else if (sessionId == 0) lcdShow("No session", "Ask your lecturer to open a session");  // nothing to record into
-  else lcdShow("Ready " + courseCode, "Place finger");  // normal
-}
-
-// =====================================================================
-// offline queue (LittleFS)
-// =====================================================================
-int countQueue() {  // counts lines in the queue file
-  File f = LittleFS.open(QUEUE_FILE, "r");     // open for reading
-  if (!f) return 0;                            // no file = empty
-  int n = 0;                                   // line counter
-  while (f.available()) { String line = f.readStringUntil('\n'); if (line.length() > 2) n++; }  // count real lines
-  f.close();                                   // done
-  return n;                                    // total
-}
-
-bool queueAdd(const String &eventJson) {  // saves one scan for later
-  if (queueCount >= QUEUE_MAX) return false;   // full (very unlikely: 500+ scans offline)
-  File f = LittleFS.open(QUEUE_FILE, "a");     // append mode
-  if (!f) return false;                        // flash problem
-  f.println(eventJson);                        // one event per line
-  f.close();                                   // flush to flash
-  queueCount++;                                // update counter
-  return true;                                 // saved
-}
-
-void flushQueue() {  // tries to send saved scans; keeps the ones that couldn't be sent
-  if (queueCount == 0 || WiFi.status() != WL_CONNECTED || !clockValid()) return;  // nothing to do / can't send
-  File in = LittleFS.open(QUEUE_FILE, "r");    // saved events
-  if (!in) { queueCount = 0; return; }         // file gone
-  File out = LittleFS.open(QUEUE_TMP, "w");    // events we still have to keep
-  bool stop = false;                           // set when the server stops answering
-  int kept = 0, sent = 0;                      // counters
-  while (in.available()) {                     // each saved event
-    String line = in.readStringUntil('\n'); line.trim();  // one JSON body
-    if (line.length() < 3) continue;           // skip empty lines
-    if (!stop) {                               // still online
-      lcdShow("Syncing...", String(sent + 1) + " of " + String(queueCount));  // progress
-      ApiResult r = api("POST", "/device/attendance", line);  // same body, fresh signature (idempotency key prevents doubles)
-      if (r.code == 200 || r.code == 404 || r.code == 409 || r.code == 422) { sent++; continue; }  // final answer: drop it (lecturer resolves conflicts)
-      stop = true;                             // no answer / auth problem: keep this one and the rest
+    lcdShow(title, "Taking picture...");  // capturing
+    if (!requestPicture(detail)) {  // camera or link failed
+      Serial.println("Picture failed: " + detail);  // log
+      continue;  // next attempt
     }
-    out.println(line); kept++;                 // keep for next time
+    beep(1, 150, 0);  // shutter sound
+    lcdShow(title, "Checking face...");  // uploading
+    ApiResponse r = api("POST", "/device/commands/" + String(commandId) + "/face", frame, FRAME_LEN, "application/octet-stream");  // raw picture, signed
+    if (r.code != 200) {  // upload failed
+      detail = r.code < 0 ? "upload_failed" : "server_" + String(r.code) + " " + errorDetail(r);  // reason
+      Serial.println("Upload failed: " + detail);  // log
+      if (r.code == 404 || r.code == 409) break;  // command no longer valid: stop
+      continue;  // try again
+    }
+    JsonDocument res;  // {"status": "...", "full_name": "..."}
+    deserializeJson(res, r.body);  // parse
+    String status = String(res["status"] | "");  // ok / no_match / no_face / multiple_faces / poor_quality
+    String who = String(res["full_name"] | name.c_str());  // name to show
+    if (status == "ok") {  // saved (enrol) or matched (verify)
+      feedback('g', enrol ? "Face saved" : "Verified", who);  // success
+      postResult(commandId, true, enrol ? "face_enrolled" : "face_verified");  // close the command
+      return;  // done
+    }
+    detail = status;  // remember why
+    if (status == "no_match") break;  // a different person: retaking won't help
+    feedback('y', "Try again", faceMessage(status));  // retake hint
   }
-  in.close(); out.close();                     // close both
-  LittleFS.remove(QUEUE_FILE);                 // replace the old queue...
-  LittleFS.rename(QUEUE_TMP, QUEUE_FILE);      // ...with what is left
-  queueCount = kept;                           // update counter
-  if (sent > 0) { feedback(kept ? 'y' : 'g', 1, 80, "Synced " + String(sent), kept ? String(kept) + " still waiting" : "All scans sent"); lcdWait(1500); }  // tell the room
-  showIdle();                                  // back to waiting
+  feedback('r', title + " failed", faceMessage(detail));  // gave up
+  postResult(commandId, false, detail);  // tell the dashboard
 }
 
-// =====================================================================
-// fingerprint helpers
-// =====================================================================
-bool waitForFinger(uint16_t timeoutMs) {  // waits for a finger image or times out
-  unsigned long start = millis();              // start
-  while (millis() - start < timeoutMs) {       // until timeout
-    if (finger.getImage() == FINGERPRINT_OK) return true;  // got an image
-    lcdTick(); delay(50);                      // keep scrolling, short pause
-  }
-  return false;                                // no finger
-}
-
-void waitForRemoval() {  // waits until the finger is lifted
-  unsigned long start = millis();              // start
-  while (finger.getImage() != FINGERPRINT_NOFINGER && millis() - start < 8000) { lcdTick(); delay(50); }  // max 8 s
-}
-
-String firstName(const String &full) {  // "Lesiba Lucky Manala" -> "Lesiba"
-  int sp = full.indexOf(' ');                  // first space
-  return sp > 0 ? full.substring(0, sp) : full;  // first word
-}
-
-// =====================================================================
-// one attendance scan
-// =====================================================================
-void handleScan() {  // called when a finger touches the sensor
-  setLed('y');                                 // busy
-  lcdShow("Scanning...", "Hold still");        // tell the student
-  if (finger.image2Tz(1) != FINGERPRINT_OK) {  // image -> features
-    feedback('r', 1, 400, "Unclear print", "Press firmly with a clean, dry finger");  // bad image
-    waitForRemoval(); lcdWait(RESULT_SHOW_MS); showIdle(); return;  // try again
-  }
-  uint8_t r = finger.fingerSearch();           // 1:N search on the sensor
-  if (r == FINGERPRINT_NOTFOUND) {             // not enrolled
-    feedback('r', 1, 600, "Not recognised", "Try again or see your lecturer");  // tell the student
-    waitForRemoval(); lcdWait(RESULT_SHOW_MS); showIdle(); return;  // done
-  }
-  if (r != FINGERPRINT_OK) {                   // talk error with the sensor
-    feedback('r', 1, 600, "Sensor error", "Check fingerprint sensor wiring");  // hint
-    waitForRemoval(); lcdWait(RESULT_SHOW_MS); showIdle(); return;  // done
-  }
-  int slot = finger.fingerID, conf = finger.confidence;  // who (slot) and how sure (score)
-  Serial.printf("Match: slot %d, confidence %d\n", slot, conf);  // log
-  if (sessionId == 0) {                        // nothing to record into
-    feedback('r', 2, 90, "No session open", "Ask your lecturer");  // tell the student
-    waitForRemoval(); lcdWait(RESULT_SHOW_MS); showIdle(); return;  // done
-  }
-  String body = "{\"idempotency_key\":\"" + randomHex(16) + "\",\"session_id\":" + String(sessionId) +  // made ONCE per scan
-                ",\"slot_number\":" + String(slot) + ",\"confidence\":" + String(conf) +  // match details
-                (clockValid() ? String(",\"device_time\":\"") + isoUtcNow() + "\"" : String("")) + "}";  // scan time (UTC)
-  lcdShow("Checking...", "Please wait");       // talking to the server
-  ApiResult res = api("POST", "/device/attendance", body);  // send it
-  if (res.code == 200) {                       // server decided
-    String status = jsonString(res.body, "status");  // recorded / duplicate / low_confidence / not_in_course
-    String name = firstName(jsonString(res.body, "full_name"));  // for the greeting
-    if (status == "recorded") feedback('g', 1, 140, "Welcome " + name, "Recorded");  // success
-    else if (status == "duplicate") feedback('r', 2, 90, "Already recorded", name);  // already present
-    else if (status == "not_in_course") feedback('r', 1, 650, "Not on class list", "See your lecturer");  // wrong course
-    else if (status == "low_confidence") feedback('r', 1, 650, "Not sure it's you", "See your lecturer");  // weak match (face check comes later with the camera ESP)
-    else feedback('r', 1, 650, "Unexpected reply", status);  // safety net
-  } else if (res.code == 409) {                // session closed while scanning
-    sessionId = 0; feedback('r', 2, 90, "Session closed", "Ask your lecturer");  // tell the student
-  } else if (res.code == 404) {                // unknown slot or session
-    String detail = jsonString(res.body, "detail");  // which one
-    if (detail == "unknown_slot") feedback('r', 1, 650, "Not registered", "Ask admin to enrol you again");  // sensor has a finger the server doesn't know
-    else { sessionId = 0; feedback('r', 2, 90, "Session ended", "Ask your lecturer"); }  // session gone
-  } else if (res.code == 401) {                // our signature was rejected: don't queue (it would fail again)
-    feedback('r', 1, 650, "Terminal error", "Device not authorised - call admin");  // tell the room
-  } else {                                     // no answer / server error: save for later
-    if (queueAdd(body)) feedback('y', 1, 140, "Saved offline", "Will sync when online");  // design rule: only say saved when it really is
-    else feedback('r', 1, 650, "Not saved", "See your lecturer");  // queue full or flash error
-  }
-  waitForRemoval();                            // one touch = one scan
-  lcdWait(RESULT_SHOW_MS);                     // keep the result visible
-  showIdle();                                  // back to waiting
-}
-
-// =====================================================================
-// enrol / delete jobs from the dashboard
-// =====================================================================
-String enrolFinger(int slot, const String &name) {  // returns "" on success, or an error text for the dashboard
-  String who = firstName(name);                // short name for the LCD
-  setLed('y');                                 // busy
-  feedback('y', 1, 60, "Enrol " + who, "Place finger");  // first touch
-  if (!waitForFinger(FINGER_TIMEOUT_MS)) return "timeout_first_finger";  // nobody came
-  if (finger.image2Tz(1) != FINGERPRINT_OK) return "unclear_first_image";  // bad image
-  lcdShow("OK", "Remove finger");              // lift
-  waitForRemoval(); lcdWait(500);              // wait for lift
-  feedback('y', 1, 60, "Place same", "finger again");  // second touch
-  if (!waitForFinger(FINGER_TIMEOUT_MS)) return "timeout_second_finger";  // nobody came
-  if (finger.image2Tz(2) != FINGERPRINT_OK) return "unclear_second_image";  // bad image
-  if (finger.createModel() != FINGERPRINT_OK) return "prints_did_not_match";  // two different fingers / bad placement
-  if (finger.storeModel(slot) != FINGERPRINT_OK) return "store_failed";  // slot out of range or flash error
-  waitForRemoval();                            // tidy up
-  return "";                                   // success
-}
-
-void reportResult(int commandId, bool success, const String &detail) {  // tells the server how a job went
-  String body = String("{\"success\":") + (success ? "true" : "false") + (detail.length() ? String(",\"detail\":\"") + detail + "\"" : String("")) + "}";  // JSON
-  for (int attempt = 0; attempt < 3; attempt++) {  // try a few times
-    ApiResult r = api("POST", "/device/commands/" + String(commandId) + "/result", body);  // signed POST
-    if (r.code > 0 && r.code < 500) return;    // server answered (even "already cancelled" is final)
-    delay(2000);                               // wait and retry
+void pollCommands() {  // ask the server for queued work
+  ApiResponse r = api("GET", "/device/commands/next", nullptr, 0, nullptr);  // no body
+  if (r.code != 200) return;  // 204 = nothing to do, or offline
+  JsonDocument doc;  // the command
+  if (deserializeJson(doc, r.body)) return;  // garbled
+  int id = doc["command_id"] | 0;  // echo back in the result
+  String type = String(doc["type"] | "");  // what to do
+  int slot = doc["slot_number"] | 0;  // sensor slot
+  String name = String(doc["full_name"] | "");  // student name (enrol / face)
+  Serial.printf("Command %d: %s slot %d %s\n", id, type.c_str(), slot, name.c_str());  // log
+  if (type == "enrol") {  // add a fingerprint
+    String detail = "";  // failure reason
+    bool ok = fingerOk && enrolFinger(slot, name, detail);  // do it
+    if (!fingerOk) detail = "sensor_offline";  // sensor missing
+    if (ok) feedback('g', "Enrolled", name);  // success
+    else feedback('r', "Enrol failed", detail);  // failure
+    postResult(id, ok, detail);  // report
+  } else if (type == "delete_slot") {  // POPIA wipe
+    uint8_t res = fingerOk ? finger.deleteModel(slot) : FINGERPRINT_PACKETRECIEVEERR;  // remove the template
+    bool ok = res == FINGERPRINT_OK;  // deleted (an empty slot also reports OK)
+    lcdShow(ok ? "Fingerprint" : "Delete failed", ok ? "deleted from slot " + String(slot) : "Slot " + String(slot));  // brief note
+    lcdWait(1500);  // show it
+    postResult(id, ok, ok ? "" : "delete_failed_" + String(res));  // report
+  } else if (type == "face_enrol" || type == "face_verify") {  // face picture from the camera ESP32
+    runFaceCommand(id, type == "face_enrol", name);  // capture, upload, report
+  } else {  // a type this firmware doesn't know
+    postResult(id, false, "unsupported_command");  // the dashboard sees it failed
   }
 }
 
-void pollCommands() {  // asks for the next enrol / delete job
-  ApiResult r = api("GET", "/device/commands/next", "");  // signed GET
-  if (r.code != 200) return;                   // 204 = nothing to do; anything else = try later
-  JSON_DOC(doc);                               // parse the job
-  if (deserializeJson(doc, r.body)) return;    // not JSON
-  int id = doc["command_id"] | 0;              // job id
-  String type = String((const char *)(doc["type"] | ""));  // enrol / delete_slot
-  int slot = doc["slot_number"] | 0;           // sensor slot
-  String name = String((const char *)(doc["full_name"] | ""));  // student name (enrol only)
-  if (id == 0 || slot == 0) return;            // incomplete job
-  if (type == "enrol") {                       // admin asked us to register a finger
-    String err = enrolFinger(slot, name);      // guide the student
-    if (err == "") feedback('g', 1, 140, "Enrolled!", firstName(name) + " - slot " + String(slot));  // success
-    else feedback('r', 1, 650, "Enrol failed", err);  // failure (dashboard shows Try again)
-    reportResult(id, err == "", err);          // tell the server
-  } else if (type == "delete_slot") {          // consent withdrawn / student removed: wipe the template
-    uint8_t res = finger.deleteModel(slot);    // delete on the sensor
-    bool ok = res == FINGERPRINT_OK;           // success?
-    Serial.printf("Delete slot %d -> %s\n", slot, ok ? "ok" : "failed");  // log
-    reportResult(id, ok, ok ? "" : "sensor_delete_error");  // tell the server
-    return;                                    // no screen change for wipes
-  }
-  lcdWait(RESULT_SHOW_MS);                     // show the enrol result
-  showIdle();                                  // back to waiting
+// ---------- Wi-Fi ----------
+void connectWifi(unsigned long waitMs) {  // join the network (non-fatal if it fails)
+  WiFi.mode(WIFI_STA);  // station
+  WiFi.setAutoReconnect(true);  // rejoin after drops
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);  // start
+  unsigned long start = millis();  // start time
+  while (WiFi.status() != WL_CONNECTED && millis() - start < waitMs) { lcdTick(); delay(200); }  // wait
+  Serial.println(WiFi.status() == WL_CONNECTED ? "Wi-Fi connected, IP " + WiFi.localIP().toString() : "Wi-Fi not connected yet");  // log
 }
 
-// =====================================================================
-// Wi-Fi + clock
-// =====================================================================
-void connectWifi(unsigned long maxWaitMs) {  // starts Wi-Fi and waits up to maxWaitMs
-  WiFi.mode(WIFI_STA);                         // join a network
-  WiFi.begin(WIFI_SSID, WIFI_PASS);            // credentials from secrets.h
-  unsigned long start = millis();              // start
-  while (WiFi.status() != WL_CONNECTED && millis() - start < maxWaitMs) { lcdTick(); delay(250); }  // wait
-}
-
-void syncClock() {  // sets the clock from the internet (UTC)
-  configTime(0, 0, "pool.ntp.org", "time.google.com");  // NTP servers
-  unsigned long start = millis();              // start
-  while (!clockValid() && millis() - start < 15000) { lcdTick(); delay(250); }  // wait up to 15 s
-  Serial.println(clockValid() ? "Clock synced: " + isoUtcNow() : String("Clock NOT synced yet"));  // log
-}
-
-// =====================================================================
-// setup + loop
-// =====================================================================
+// ---------- start-up ----------
 void setup() {
-  Serial.begin(115200);                        // debug output
-  pinMode(LED_GREEN, OUTPUT); pinMode(LED_YELLOW, OUTPUT); pinMode(LED_RED, OUTPUT); pinMode(BUZZER_PIN, OUTPUT);  // outputs
-  setLed(0); digitalWrite(BUZZER_PIN, LOW);    // all off
-  lcd.begin(16, 2);                            // LCD
-  lcdShow("BSAVS terminal", "Starting...");    // boot screen
-  setLed('g'); delay(150); setLed('y'); delay(150); setLed('r'); delay(150); setLed(0); beep(1, 60);  // quick LED + buzzer self-test
+  Serial.begin(115200);  // USB log
+  pinMode(LED_GREEN, OUTPUT);  // LEDs
+  pinMode(LED_YELLOW, OUTPUT);  // LEDs
+  pinMode(LED_RED, OUTPUT);  // LEDs
+  pinMode(BUZZER, OUTPUT);  // buzzer
+  leds(true, true, true);  // lamp test
+  beep(1, 80, 0);  // buzzer test
+  lcd.begin(16, 2);  // 16 x 2 LCD
+  lcdShow("Attendance", "Starting...");  // boot screen
+  frame = (uint8_t *)malloc(FRAME_LEN);  // picture buffer first, before Wi-Fi splits the RAM up
+  if (!frame) Serial.println("No RAM for the picture buffer: face commands will fail");  // unlikely
+  leds(false, false, false);  // lamp test over
 
   fingerSerial.begin(FP_BAUD, SERIAL_8N1, FP_RX_PIN, FP_TX_PIN);  // sensor UART
-  delay(300);                                  // sensor power-up
-  if (!finger.verifyPassword()) {              // no reply from the sensor
-    feedback('r', 3, 200, "Sensor NOT found", "Check: green to GPIO16, white to GPIO17");  // tell the technician
-    while (true) lcdWait(1000);                // stop here (reset after fixing)
-  }
-  if (!LittleFS.begin(true)) Serial.println("LittleFS mount failed - offline queue disabled");  // true = format on first use
-  queueCount = countQueue();                   // scans left from last time
-  Serial.printf("Offline queue: %d event(s)\n", queueCount);  // log
+  delay(300);  // sensor power-up
+  fingerOk = finger.verifyPassword();  // handshake
+  lcdShow(fingerOk ? "Sensor OK" : "Sensor NOT found", fingerOk ? "DY50 ready" : "Check green->16, white->17");  // result
+  lcdWait(1000);  // show it
 
-  lcdShow("Connecting WiFi", WIFI_SSID);       // progress
-  connectWifi(20000);                          // up to 20 s
-  if (WiFi.status() == WL_CONNECTED) {         // online
-    Serial.print("Wi-Fi OK, IP "); Serial.println(WiFi.localIP());  // log
-    lcdShow("Setting clock", "pool.ntp.org");  // progress
-    syncClock();                               // NTP
-  }
-  tls.setInsecure();                           // demo: don't check the server certificate (requests are still HMAC-signed). Future work: pin Render's CA.
-  http.setReuse(true);                         // keep the TLS connection open between requests (much faster)
-  lcdShow("Contacting server", "First start can take up to 1 min");  // the free Render server may be asleep
-  pollSession();                               // which session is open?
-  showIdle();                                  // ready
+  camSerial.setRxBufferSize(8192);  // room for bursts while a picture streams in at 921 600 baud
+  camSerial.begin(CAM_BAUD, SERIAL_8N1, CAM_RX_PIN, CAM_TX_PIN);  // camera link
+  for (int i = 0; i < 10 && !cameraOk; i++) { cameraOk = pingCamera(); if (!cameraOk) delay(500); }  // the camera board may still be starting
+  lcdShow(cameraOk ? "Camera OK" : "Camera NOT found", cameraOk ? "Face checks ready" : "Check link wires and GND");  // result
+  lcdWait(1000);  // show it
+
+  secureClient.setInsecure();  // encrypt without checking the server certificate (demo); requests are still HMAC-signed
+  lcdShow("Connecting", WIFI_SSID);  // Wi-Fi
+  connectWifi(20000);  // up to 20 s
+  if (WiFi.status() == WL_CONNECTED) syncClock();  // NTP time for signatures
+  queueStore.begin("offq", false);  // offline queue in flash
+  if (WiFi.status() == WL_CONNECTED) { refreshSession(); flushQueue(); }  // first look at the server
+  nextCommandPoll = millis();  // poll straight away
+  nextSessionPoll = millis() + SESSION_POLL_MS;  // then every 30 s
+  idleShown = "";  // force the idle screen
+  showIdle();  // ready
 }
 
+// ---------- main loop ----------
 void loop() {
-  lcdTick();                                   // keep long messages scrolling
-
-  if (Serial.available()) {                    // technician commands
-    String line = Serial.readStringUntil('\n'); line.trim();  // one line
-    if (line == "i") { finger.getTemplateCount(); Serial.printf("Templates stored: %d\n", finger.templateCount); }  // sensor info
-    else if (line == "s") Serial.printf("WiFi=%s session=%d (%s) queue=%d clock=%s\n", WiFi.status() == WL_CONNECTED ? "ok" : "down", sessionId, courseCode.c_str(), queueCount, clockValid() ? isoUtcNow().c_str() : "not set");  // status
-    else if (line == "q") Serial.printf("Offline queue: %d\n", queueCount);  // queue size
-    else if (line == "x") {                    // wipe the sensor (do this once before real use)
-      Serial.println("Type YES to delete ALL fingerprints on the sensor:");  // confirm
-      while (!Serial.available()) delay(10);   // wait for the answer
-      String c = Serial.readStringUntil('\n'); c.trim();  // read it
-      Serial.println(c == "YES" && finger.emptyDatabase() == FINGERPRINT_OK ? "All deleted." : "Cancelled.");  // result
-    }
+  lcdTick();  // keep long lines moving
+  unsigned long now = millis();  // current time
+  bool online = WiFi.status() == WL_CONNECTED;  // network up?
+  if (!online && (long)(now - nextWifiRetry) >= 0) {  // dropped
+    WiFi.reconnect();  // try again
+    nextWifiRetry = now + WIFI_RETRY_MS;  // not too often
   }
-
-  if (WiFi.status() != WL_CONNECTED && millis() > nextWifiRetry) {  // Wi-Fi dropped
-    nextWifiRetry = millis() + WIFI_RETRY_MS;  // don't hammer it
-    WiFi.disconnect(); WiFi.begin(WIFI_SSID, WIFI_PASS);  // try again (non-blocking)
-    showIdle();                                // show "Offline"
+  if (online && !clockOk) syncClock();  // got online after a cold start
+  if (online && (long)(now - nextCommandPoll) >= 0) {  // dashboard work?
+    pollCommands();  // handle at most one command
+    nextCommandPoll = millis() + COMMAND_POLL_MS;  // next poll
   }
-  if (WiFi.status() == WL_CONNECTED && !clockValid()) syncClock();  // came online without a clock
-
-  if (finger.getImage() == FINGERPRINT_OK) { handleScan(); return; }  // a finger: scanning always comes first
-
-  unsigned long now = millis();                // current time
-  if (now > nextCommandPoll) { nextCommandPoll = now + COMMAND_POLL_MS; pollCommands(); }  // enrol / delete jobs
-  if (now > nextSessionPoll) { nextSessionPoll = now + SESSION_POLL_MS; int before = sessionId; pollSession(); if (sessionId != before) showIdle(); }  // session opened/closed?
-  if (now > nextQueueFlush) { nextQueueFlush = now + QUEUE_FLUSH_MS; flushQueue(); }  // send saved scans
-  delay(30);                                   // small pause
+  if (online && (long)(now - nextSessionPoll) >= 0) {  // session changed?
+    refreshSession();  // ask
+    nextSessionPoll = millis() + SESSION_POLL_MS;  // next check
+  }
+  if (online && queueCount() > 0 && (long)(now - nextQueueFlush) >= 0) {  // offline scans waiting
+    flushQueue();  // send them
+    nextQueueFlush = millis() + QUEUE_FLUSH_MS;  // next try
+  }
+  showIdle();  // correct waiting screen
+  scanForFinger();  // student at the sensor?
+  delay(30);  // breathe
 }
