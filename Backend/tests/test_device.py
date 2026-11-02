@@ -29,6 +29,11 @@ def test_health(client):
     assert client.get("/health").status_code == 200
 
 
+def test_heartbeat_keeps_device_online(call):
+    response = call("POST", "/device/heartbeat")
+    assert response.status_code == 204
+
+
 def test_wrong_secret_rejected(call):
     response = call("GET", "/device/session", secret="wrong" * 13)
     assert response.status_code == 401

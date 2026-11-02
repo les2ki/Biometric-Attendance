@@ -82,6 +82,7 @@ class Attendance(Base):  # one row = one student present in one session
     device_id: Mapped[int | None] = mapped_column(ForeignKey("devices.id"))  # NULL for manual dashboard entries
     method: Mapped[Method] = mapped_column(Enum(Method, name="attendance_method"))  # fingerprint / face / manual
     fp_confidence: Mapped[int | None]  # R307 match score, kept to tune your threshold
+    face_score: Mapped[float | None] = mapped_column()  # cosine similarity when attendance was verified by face
     device_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # terminal RTC time (supporting only)
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())  # canonical time
     idempotency_key: Mapped[str | None] = mapped_column(String(64), unique=True)  # retried/synced events reuse it
@@ -164,6 +165,8 @@ class DeviceCommand(Base):  # work queued for a terminal (enrol a finger / wipe 
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # when it finished (done/failed/cancelled/expired)
     result_detail: Mapped[str | None] = mapped_column(String(255))  # terminal error text or cancel reason
     session_id: Mapped[int | None] = mapped_column(ForeignKey("sessions.id", ondelete="SET NULL"))  # FACE: session to mark present after a lecturer's face verify
+    frames_received: Mapped[int] = mapped_column(default=0, server_default="0")  # face pictures the terminal uploaded for this command
+    face_score: Mapped[float | None] = mapped_column()  # latest/best face similarity for dashboard feedback
 
 
 class FaceTemplate(Base):  # FACE: one face template (128 numbers from SFace) per student; the picture itself is never stored

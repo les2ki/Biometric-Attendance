@@ -51,6 +51,7 @@ const unsigned long COMMAND_POLL_MS = 3000;  // how often to ask for dashboard w
 const unsigned long SESSION_POLL_MS = 30000; // how often to re-check the open session
 const unsigned long QUEUE_FLUSH_MS = 10000;  // how often to retry offline scans
 const unsigned long WIFI_RETRY_MS = 15000;   // how often to retry Wi-Fi when it drops
+const unsigned long HEARTBEAT_MS = 10000;    // stay online while waiting for fingerprints or face capture
 const uint16_t HTTP_TIMEOUT_MS = 15000;      // per request (picture uploads take a few seconds)
 const unsigned long CAMERA_TIMEOUT_MS = 8000;// 3 camera attempts + ~1 s transfer
 const int FACE_TRIES = 3;                    // pictures per face command before giving up
@@ -80,61 +81,61 @@ unsigned long nextCommandPoll = 0;  // millis() of the next command poll
 unsigned long nextSessionPoll = 0;  // millis() of the next session check
 unsigned long nextQueueFlush = 0;   // millis() of the next offline-queue retry
 unsigned long nextWifiRetry = 0;    // millis() of the next Wi-Fi retry
+unsigned long nextHeartbeat = 0;    // millis() of the next liveness ping during long prompts
 String idleShown = "";              // which idle screen is showing (avoids redrawing every loop)
 
-// ---------- LCD with scrolling (from fingerprint_lcd_test.ino) ----------
-const int LCD_COLS = 16;                         // characters per line
+void heartbeatIfDue();  // used by the LCD and biometric wait loops below
+
+// ---------- LCD with scrolling (16x1 modules usually map internally as 8x2) ----------
+const int LCD_COLS = 16;                         // visible characters across the physical row
+const bool LCD_SPLIT_8X2 = true;                 // first 8 characters are controller row 0, next 8 are row 1
 const unsigned long SCROLL_STEP_MS = 350;        // time between scroll steps
 const unsigned long SCROLL_START_DELAY_MS = 1000;// pause before a long line scrolls
 const char *SCROLL_GAP = "    ";                 // gap between a message and its repeat
-String lcdLine[2];                               // full text of each line
-int lcdOffset[2] = {0, 0};                       // scroll position of each line
+String lcdText = "";                             // complete text shown across the one physical row
+int lcdOffset = 0;                               // scroll position
 unsigned long lcdNextScroll = 0;                 // millis() of the next scroll step
 
-void lcdDrawLine(int row) {  // draw the visible 16 characters of one line
-  String text = lcdLine[row];  // full message
+void lcdDraw() {  // draw the visible 16 characters across the physical row
   String window = "";  // what gets printed
-  if ((int)text.length() <= LCD_COLS) {  // fits
-    window = text;  // as is
+  if ((int)lcdText.length() <= LCD_COLS) {  // fits
+    window = lcdText;  // as is
   } else {  // too long: moving window
-    String loopText = text + SCROLL_GAP;  // message plus gap
-    for (int i = 0; i < LCD_COLS; i++) window += loopText.charAt((lcdOffset[row] + i) % loopText.length());  // 16 chars from the offset
+    String loopText = lcdText + SCROLL_GAP;  // message plus gap
+    for (int i = 0; i < LCD_COLS; i++) window += loopText.charAt((lcdOffset + i) % loopText.length());  // 16 chars from the offset
   }
   while ((int)window.length() < LCD_COLS) window += ' ';  // pad to clear old text
-  lcd.setCursor(0, row);  // start of the row
-  lcd.print(window);  // print it
+  lcd.setCursor(0, 0);  // physical characters 1-8
+  lcd.print(window.substring(0, 8));  // first controller row
+  lcd.setCursor(0, 1);  // physical characters 9-16
+  lcd.print(window.substring(8, 16));  // second controller row maps to the right half
 }
 
-void lcdShow(const String &line1, const String &line2) {  // set both lines (long ones scroll)
-  lcdLine[0] = line1;  // top
-  lcdLine[1] = line2;  // bottom
-  lcdOffset[0] = 0;  // from the start
-  lcdOffset[1] = 0;  // from the start
+void lcdShow(const String &line1, const String &line2) {  // join a title and detail into the one physical LCD row
+  lcdText = line2.length() ? line1 + " - " + line2 : line1;  // one clear message that scrolls when needed
+  lcdOffset = 0;  // from the start
   lcdNextScroll = millis() + SCROLL_START_DELAY_MS;  // pause before scrolling
   lcd.clear();  // wipe
-  lcdDrawLine(0);  // draw top
-  lcdDrawLine(1);  // draw bottom
+  lcdDraw();  // draw the complete row
   idleShown = "";  // the idle screen must be redrawn later
 }
 
-void lcdTick() {  // call often: scrolls long lines
+void lcdTick() {  // call often: scrolls long text
   if ((long)(millis() - lcdNextScroll) < 0) return;  // not yet
   lcdNextScroll = millis() + SCROLL_STEP_MS;  // next step
-  for (int row = 0; row < 2; row++) {  // both lines
-    int len = lcdLine[row].length();  // length
-    if (len <= LCD_COLS) continue;  // short lines stay still
-    lcdOffset[row] = (lcdOffset[row] + 1) % (len + strlen(SCROLL_GAP));  // one step
-    lcdDrawLine(row);  // redraw
-  }
+  int len = lcdText.length();  // length
+  if (len <= LCD_COLS) return;  // short text stays still
+  lcdOffset = (lcdOffset + 1) % (len + strlen(SCROLL_GAP));  // one step
+  lcdDraw();  // redraw
 }
 
 void lcdWait(unsigned long minMs) {  // wait, keep scrolling, long enough to read the message once
-  int longest = max(lcdLine[0].length(), lcdLine[1].length());  // longest line
+  int longest = lcdText.length();  // one physical row
   unsigned long readMs = SCROLL_START_DELAY_MS;  // time to read it all
   if (longest > LCD_COLS) readMs += (unsigned long)(longest - LCD_COLS + 2) * SCROLL_STEP_MS;  // time to scroll to the end
   unsigned long waitMs = max(minMs, readMs);  // never shorter than asked
   unsigned long start = millis();  // start
-  while (millis() - start < waitMs) { lcdTick(); delay(20); }  // wait
+  while (millis() - start < waitMs) { heartbeatIfDue(); lcdTick(); delay(20); }  // wait without appearing offline
 }
 
 // ---------- LEDs and buzzer ----------
@@ -209,9 +210,9 @@ String signRequest(const String &method, const String &path, uint32_t ts, const 
 // ---------- HTTP ----------
 ApiResponse api(const char *method, const String &path, const uint8_t *body, size_t len, const char *contentType) {  // one signed request
   ApiResponse res = {-1, ""};  // assume failure
-  if (WiFi.status() != WL_CONNECTED) return res;  // offline
+  if (WiFi.status() != WL_CONNECTED) { Serial.println("API skipped: Wi-Fi offline"); return res; }  // offline
   if (!clockOk) syncClock();  // signatures need the time
-  if (!clockOk) return res;  // still no clock
+  if (!clockOk) { Serial.println("API skipped: clock not set"); return res; }  // still no clock
   uint32_t ts = (uint32_t)time(nullptr);  // X-Timestamp
   String nonce = randomHex(16);  // X-Nonce, 32 hex chars, single use
   String sig = signRequest(method, path, ts, nonce, body, len);  // X-Signature
@@ -220,7 +221,7 @@ ApiResponse api(const char *method, const String &path, const uint8_t *body, siz
   http.setReuse(true);  // keep the connection open between requests (saves a TLS handshake each poll)
   http.setTimeout(HTTP_TIMEOUT_MS);  // give up after this
   bool started = url.startsWith("https") ? http.begin(secureClient, url) : http.begin(plainClient, url);  // HTTPS or plain HTTP
-  if (!started) return res;  // bad URL
+  if (!started) { Serial.println("API start failed: check API_BASE_URL"); return res; }  // bad URL or TLS setup
   http.addHeader("X-Device-Id", String(DEVICE_ID));  // who we are
   http.addHeader("X-Timestamp", String(ts));  // when
   http.addHeader("X-Nonce", nonce);  // single-use random
@@ -243,6 +244,13 @@ String errorDetail(const ApiResponse &r) {  // FastAPI errors look like {"detail
   return String(doc["detail"] | "");  // the reason, or empty
 }
 
+void heartbeatIfDue() {  // a command can wait for a person longer than the dashboard liveness window
+  if (WiFi.status() != WL_CONNECTED || (long)(millis() - nextHeartbeat) < 0) return;  // no network or not due
+  nextHeartbeat = millis() + HEARTBEAT_MS;  // schedule before the request so a timeout cannot create a request storm
+  ApiResponse r = api("POST", "/device/heartbeat", nullptr, 0, nullptr);  // a valid signed request refreshes last_seen_at
+  if (r.code != 204) Serial.println("Heartbeat failed: " + String(r.code));  // visible, non-secret diagnosis
+}
+
 // ---------- session ----------
 void refreshSession() {  // ask which session is open on this terminal
   ApiResponse r = api("GET", "/device/session", nullptr, 0, nullptr);  // no body
@@ -262,11 +270,13 @@ void refreshSession() {  // ask which session is open on this terminal
 
 void showIdle() {  // waiting screen, redrawn only when it changes
   String want;  // which screen
-  if (WiFi.status() != WL_CONNECTED && !sessionOpen) want = "offline";  // no network, no session
+  if (!fingerOk) want = "sensor";  // never pretend the terminal can scan without its sensor
+  else if (WiFi.status() != WL_CONNECTED && !sessionOpen) want = "offline";  // no network, no session
   else if (!sessionOpen) want = "nosession";  // waiting for a lecturer
   else want = "session" + String(sessionId) + (WiFi.status() == WL_CONNECTED ? "" : "off");  // taking scans
   if (want == idleShown) return;  // already showing
-  if (want == "offline") lcdShow("Offline", "Connecting to Wi-Fi...");  // no network
+  if (want == "sensor") lcdShow("Sensor error", "Check DY50 wires");  // clear hardware fault
+  else if (want == "offline") lcdShow("Offline", "Connecting to Wi-Fi...");  // no network
   else if (want == "nosession") lcdShow("No session open", "Waiting for the lecturer to open a session");  // idle
   else lcdShow(sessionCourse + " " + sessionVenue, WiFi.status() == WL_CONNECTED ? "Place your finger" : "Offline: place finger, saved for later");  // ready
   digitalWrite(LED_YELLOW, WiFi.status() != WL_CONNECTED);  // yellow while offline
@@ -310,6 +320,7 @@ bool waitForFinger(uint16_t timeoutMs) {  // wait for a finger image
   unsigned long start = millis();  // start
   while (millis() - start < timeoutMs) {  // until timeout
     if (finger.getImage() == FINGERPRINT_OK) return true;  // got one
+    heartbeatIfDue();  // dashboard still sees this terminal while a student approaches
     lcdTick();  // keep scrolling
     delay(50);  // pause
   }
@@ -318,7 +329,7 @@ bool waitForFinger(uint16_t timeoutMs) {  // wait for a finger image
 
 void waitForRemoval() {  // wait until the finger is lifted (max 5 s)
   unsigned long start = millis();  // start
-  while (finger.getImage() != FINGERPRINT_NOFINGER && millis() - start < 5000) { lcdTick(); delay(50); }  // still on the glass
+  while (finger.getImage() != FINGERPRINT_NOFINGER && millis() - start < 5000) { heartbeatIfDue(); lcdTick(); delay(50); }  // still on the glass
 }
 
 void recordScan(uint16_t slot, uint16_t confidence) {  // send a match to the server and show the decision
@@ -362,7 +373,10 @@ void recordScan(uint16_t slot, uint16_t confidence) {  // send a match to the se
 }
 
 void scanForFinger() {  // quick look for a finger; full flow if there is one
-  if (!fingerOk || finger.getImage() != FINGERPRINT_OK) return;  // nobody there
+  if (!fingerOk) return;  // setup already shows the wiring fault
+  uint8_t image = finger.getImage();  // one sensor read per loop
+  if (image == FINGERPRINT_NOFINGER) return;  // nobody there
+  if (image != FINGERPRINT_OK) { Serial.printf("Fingerprint read error: 0x%02X\n", image); return; }  // visible sensor diagnosis
   if (!sessionOpen) {  // nothing to record against
     feedback('r', "No session open", "Wait for the lecturer to open the session");  // tell them
     waitForRemoval();  // one message per touch
@@ -475,6 +489,7 @@ void runFaceCommand(int commandId, bool enrol, const String &name) {  // face_en
   }
   String detail = "";  // last failure reason
   for (int attempt = 1; attempt <= FACE_TRIES; attempt++) {  // a few pictures if needed
+    heartbeatIfDue();  // capture retries can take longer than the normal device poll interval
     leds(false, true, false);  // yellow: busy
     for (int n = 3; n >= 1; n--) {  // countdown so the student is ready
       lcdShow(title + ": " + name, "Look at the camera  " + String(n));  // prompt
@@ -561,7 +576,7 @@ void setup() {
   pinMode(BUZZER, OUTPUT);  // buzzer
   leds(true, true, true);  // lamp test
   beep(1, 80, 0);  // buzzer test
-  lcd.begin(16, 2);  // 16 x 2 LCD
+  lcd.begin(LCD_SPLIT_8X2 ? 8 : 16, LCD_SPLIT_8X2 ? 2 : 1);  // 16x1 physical row, commonly addressed as 8x2 internally
   lcdShow("Attendance", "Starting...");  // boot screen
   frame = (uint8_t *)malloc(FRAME_LEN);  // picture buffer first, before Wi-Fi splits the RAM up
   if (!frame) Serial.println("No RAM for the picture buffer: face commands will fail");  // unlikely
@@ -587,6 +602,7 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) { refreshSession(); flushQueue(); }  // first look at the server
   nextCommandPoll = millis();  // poll straight away
   nextSessionPoll = millis() + SESSION_POLL_MS;  // then every 30 s
+  nextHeartbeat = millis() + HEARTBEAT_MS;  // ordinary polling already keeps the device alive until a long command starts
   idleShown = "";  // force the idle screen
   showIdle();  // ready
 }

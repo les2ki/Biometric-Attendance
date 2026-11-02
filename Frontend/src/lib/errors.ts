@@ -1,7 +1,8 @@
 import { ApiError } from "@/lib/api"; // the error class apiFetch throws
 
 const MESSAGES: Record<string, string> = { // backend error code → sentence a person can act on
-  network_error: "Can’t reach the server. Is the backend running on port 8000?", // backend down
+  network_error: "Can’t reach the API. Reload the page; if it persists, check the browser Network tab for the failed request.", // browser network or CORS failure
+  api_not_configured: "This dashboard deployment is missing its API address. Set NEXT_PUBLIC_API_URL and redeploy.", // build-time environment variable missing
   invalid_credentials: "Email or password is incorrect.", // login
   token_expired: "Your session has ended. Please log in again.", // 30-min token ran out
   invalid_token: "Your session has ended. Please log in again.", // garbled token

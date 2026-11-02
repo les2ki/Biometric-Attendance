@@ -8,9 +8,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 # Load the dedicated test database URL before importing the application.
-env_file = Path(__file__).resolve().parents[2] / ".env"
-lines = env_file.read_text(encoding="utf-8").splitlines()
-test_url = next(
+# The deployed application keeps its local .env inside Backend/, while older
+# checkouts used a repository-root .env. Support both locations.
+backend_dir = Path(__file__).resolve().parents[1]
+env_file = backend_dir / ".env"
+if not env_file.is_file():
+    env_file = backend_dir.parent / ".env"
+lines = env_file.read_text(encoding="utf-8").splitlines() if env_file.is_file() else []  # CI can supply TEST_DATABASE_URL without a local .env
+test_url = os.getenv("TEST_DATABASE_URL") or next(
     (
         line.split("=", 1)[1].strip()
         for line in lines
@@ -18,8 +23,8 @@ test_url = next(
     ),
     None,
 )
-if not test_url or not test_url.endswith("_test"):
-    raise RuntimeError("Add test_database_url=...attendance_test to .env")
+if not test_url or (not test_url.startswith("sqlite") and not test_url.split("?", 1)[0].endswith("_test")):
+    raise RuntimeError("Set TEST_DATABASE_URL or add test_database_url=...attendance_test to Backend/.env")
 os.environ["database_url"] = test_url
 
 from app.db import Base, SessionLocal, engine  # noqa: E402

@@ -1,10 +1,7 @@
 import type { TokenOut } from "@/lib/types"; // login response shape
 
-const RAW_API_URL = process.env.NEXT_PUBLIC_API_URL; // inlined at build time from .env.local
-if (!RAW_API_URL) { // missing env var = every request would fail mysteriously
-  throw new Error("NEXT_PUBLIC_API_URL is not set. Copy Frontend/.env.example to Frontend/.env.local."); // fail loudly at import
-}
-export const API_URL = RAW_API_URL.replace(/\/+$/, ""); // e.g. http://127.0.0.1:8000 (no trailing slash)
+const RAW_API_URL = process.env.NEXT_PUBLIC_API_URL?.trim(); // inlined at build time from .env.local or Netlify
+export const API_URL = RAW_API_URL ? RAW_API_URL.replace(/\/+$/, "") : ""; // a missing variable is handled when a request is attempted
 
 export class ApiError extends Error { // every failed request becomes one of these
   status: number; // HTTP status (0 = network failure)
@@ -63,7 +60,12 @@ export interface FetchOptions { // options for apiFetch
   signal?: AbortSignal; // lets TanStack Query cancel stale requests
 }
 
+function requireApiUrl(): void { // keep static pages buildable and give users a useful runtime error instead of a blank page
+  if (!API_URL) throw new ApiError(0, "api_not_configured"); // environment variable missing from this deployment
+}
+
 export async function apiFetch<T>(path: string, opts: FetchOptions = {}): Promise<T> { // the ONE way components talk to the API
+  requireApiUrl(); // never accidentally send relative requests to the Netlify site
   const headers: Record<string, string> = {}; // request headers
   let body: BodyInit | undefined; // request body
   if (opts.body instanceof FormData) { // file upload
@@ -106,6 +108,7 @@ export function qs(params: Record<string, string | number | boolean | null | und
 }
 
 export async function loginRequest(email: string, password: string): Promise<TokenOut> { // POST /auth/login as a FORM (OAuth2PasswordRequestForm)
+  requireApiUrl(); // the login screen can render even before this deployment has an API address
   let res: Response; // the response
   try { // network failure throws
     res = await fetch(`${API_URL}/auth/login`, { // the login endpoint
@@ -127,6 +130,7 @@ function filenameFrom(disposition: string | null): string | null { // read the f
 }
 
 export async function downloadFile(path: string, token: string): Promise<string> { // authenticated file download; returns the filename
+  requireApiUrl(); // do not fetch a relative URL when configuration is missing
   let res: Response; // the response
   try { // network failure throws
     res = await fetch(API_URL + path, { headers: { Authorization: `Bearer ${token}` } }); // fetch with the token
@@ -155,6 +159,7 @@ export function saveBlob(blob: Blob, filename: string): void { // trigger a brow
 }
 
 export async function fetchBlob(path: string, token: string | null, signal?: AbortSignal): Promise<Blob> { // authenticated binary GET (e.g. the face preview PNG)
+  requireApiUrl(); // do not fetch a relative URL when configuration is missing
   let res: Response; // the response
   try { // network failure throws
     res = await fetch(API_URL + path, { headers: token ? { Authorization: `Bearer ${token}` } : {}, signal, cache: "no-store" }); // never cached

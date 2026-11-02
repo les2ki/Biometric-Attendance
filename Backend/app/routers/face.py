@@ -39,7 +39,7 @@ class FaceResultOut(BaseModel):  # reply to the terminal's picture upload
 
 def _command_out(db, cmd) -> CommandOut:  # same shape the existing command lists use
     student = db.get(Student, cmd.student_id) if cmd.student_id is not None else None  # for the number
-    return CommandOut(id=cmd.id, device_id=cmd.device_id, type=cmd.type, status=cmd.status, slot_number=cmd.slot_number, student_id=cmd.student_id, student_number=student.student_number if student else None, created_at=cmd.created_at, expires_at=cmd.expires_at, completed_at=cmd.completed_at, result_detail=cmd.result_detail)  # build
+    return CommandOut(id=cmd.id, device_id=cmd.device_id, type=cmd.type, status=cmd.status, slot_number=cmd.slot_number, student_id=cmd.student_id, student_number=student.student_number if student else None, created_at=cmd.created_at, expires_at=cmd.expires_at, completed_at=cmd.completed_at, result_detail=cmd.result_detail, session_id=cmd.session_id, frames_received=cmd.frames_received or 0, face_score=cmd.face_score)  # build
 
 
 @router.get("/admin/students/{student_id}/face", response_model=FaceStatusOut, tags=["admin"])  # is a face enrolled?

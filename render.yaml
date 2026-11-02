@@ -16,7 +16,7 @@ services:
       - key: JWT_secret_key
         generateValue: true        # Render creates a random secret for you
       - key: cors_origins
-        value: http://localhost:3000
+        value: http://localhost:3000,https://biometricattendanceproject.netlify.app
       - key: hmac_max_skew_seconds
         value: "300"
       - key: jwt_expire_minutes

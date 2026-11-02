@@ -15,7 +15,8 @@ from app.services.face import face_counts  # face templates per student
 def is_online(device: Device) -> bool:  # seen within the threshold?
     if device.last_seen_at is None:  # never called in
         return False  # offline
-    return (datetime.now(timezone.utc) - device.last_seen_at).total_seconds() <= settings.device_online_seconds  # recent enough
+    last_seen = device.last_seen_at.replace(tzinfo=timezone.utc) if device.last_seen_at.tzinfo is None else device.last_seen_at.astimezone(timezone.utc)  # SQLite returns naive timestamps; Postgres does not
+    return (datetime.now(timezone.utc) - last_seen).total_seconds() <= settings.device_online_seconds  # recent enough
 
 
 def student_outs(db: Session, students: list[Student]) -> list[StudentOut]:  # students with their enrolled devices (one query)

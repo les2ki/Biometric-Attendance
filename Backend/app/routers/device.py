@@ -1,3 +1,4 @@
+from datetime import timezone  # normalize timestamps from test-only SQLite
 from typing import Annotated  # dependency typing
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status  # routing + errors
@@ -18,6 +19,15 @@ DbSession = Annotated[Session, Depends(get_db)]  # "inject a DB session"
 
 def _result(status_text: str, student: Student) -> AttendanceOut:  # builds the reply the terminal displays
     return AttendanceOut(status=status_text, student_number=student.student_number, full_name=student.full_name)  # same shape every time
+
+
+def _as_utc(value):  # Postgres preserves timezone data; SQLite-based tests return naive values
+    return value.replace(tzinfo=timezone.utc) if value is not None and value.tzinfo is None else value
+
+
+@router.post("/heartbeat", status_code=status.HTTP_204_NO_CONTENT)  # long hardware prompts must keep the terminal online
+def heartbeat(device: CurrentDevice) -> Response:  # authentication already updates device.last_seen_at
+    return Response(status_code=status.HTTP_204_NO_CONTENT)  # no payload needed
 
 
 @router.get("/session", response_model=SessionOut)  # terminal asks: "which session am I recording for?"
@@ -41,7 +51,7 @@ def mark_attendance(payload: AttendanceIn, device: CurrentDevice, db: DbSession)
     session = db.get(LectureSession, payload.session_id)  # the session the terminal cached
     if session is None or session.device_id != device.id:  # missing, or belongs to another terminal
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown_session")  # reject
-    if session.closed_at is not None and (payload.device_time is None or payload.device_time > session.closed_at):  # scanned after closing
+    if session.closed_at is not None and (payload.device_time is None or payload.device_time > _as_utc(session.closed_at)):  # scanned after closing
         raise HTTPException(status.HTTP_409_CONFLICT, "session_closed")  # SYNC_CONFLICT: lecturer resolves manually
     slot = db.scalars(select(FingerprintSlot).where(FingerprintSlot.device_id == device.id, FingerprintSlot.slot_number == payload.slot_number)).first()  # who is in that slot?
     if slot is None:  # sensor has a template the server doesn't know
@@ -83,7 +93,7 @@ def next_device_command(device: CurrentDevice, db: DbSession) -> DeviceCommandOu
         slot_number=cmd.slot_number,  # sensor slot
         student_number=student.student_number if student and cmd.type != CommandType.delete_slot else None,  # LCD info for enrol and face commands (FACE)
         full_name=student.full_name if student and cmd.type != CommandType.delete_slot else None,  # LCD info for enrol and face commands (FACE)
-        expires_at=cmd.expires_at,  # deadline (None for wipes)
+        expires_at=_as_utc(cmd.expires_at),  # deadline (None for wipes; normalize SQLite test values)
     )
 
 

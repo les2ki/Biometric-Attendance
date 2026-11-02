@@ -146,7 +146,7 @@ def handle_frame(db: Session, *, device: Device, command_id: int, raw: bytes) ->
     if cmd.status != CommandStatus.in_progress:  # expired, cancelled or finished
         raise HTTPException(status.HTTP_409_CONFLICT, "command_not_active")  # terminal stops
     if len(raw) != FRAME_LEN:  # wrong size
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "bad_frame_length")  # terminal retakes
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "bad_frame_length")  # terminal retakes
     student = db.get(Student, cmd.student_id) if cmd.student_id is not None else None  # who
     if student is None or not student.is_active or not student.biometric_consent:  # consent withdrawn meanwhile
         raise HTTPException(status.HTTP_409_CONFLICT, "command_not_active")  # don't process biometrics
