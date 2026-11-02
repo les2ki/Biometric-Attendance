@@ -23,7 +23,7 @@ export interface SessionOut { // session header
 export interface RosterEntry { // one student in one session
   student_id: number; student_number: string; full_name: string; status: RosterStatus; // who + state
   attendance_id: number | null; method: Method | null; recorded_at: string | null; device_time: string | null; // the record
-  fp_confidence: number | null; note: string | null; revoked_at: string | null; revoke_reason: string | null; // details
+  fp_confidence: number | null; face_score: number | null; face_enrolled: boolean; note: string | null; revoked_at: string | null; revoke_reason: string | null; // details
   recorded_by_name: string | null; // lecturer who entered it
 }
 export interface RosterView { session: SessionOut; entries: RosterEntry[]; } // live roster response
@@ -48,7 +48,7 @@ export interface ConsentUpdate { consent: boolean; } // PUT /admin/students/{id}
 export interface EnrolIn { device_id: number; } // POST /admin/students/{id}/enrol
 export interface StudentOut { // a student in lists
   id: number; student_number: string; full_name: string; is_active: boolean; // identity
-  biometric_consent: boolean; consent_at: string | null; enrolled_device_ids: number[]; // POPIA + enrolment
+  biometric_consent: boolean; consent_at: string | null; enrolled_device_ids: number[]; face_samples: number; // POPIA + enrolment
 }
 export interface CourseBrief { id: number; code: string; name: string; } // course reference in a student detail
 export interface SlotOut { device_id: number; device_name: string; slot_number: number; } // one fingerprint slot
@@ -56,6 +56,20 @@ export interface CommandOut { // a queued terminal command
   id: number; device_id: number; type: CommandType; status: CommandStatus; slot_number: number; // what + where
   student_id: number | null; student_number: string | null; // who
   created_at: string; expires_at: string | null; completed_at: string | null; result_detail: string | null; // when + outcome
+  session_id?: number | null; frames_received?: number; face_score?: number | null; // face command details
+}
+
+export interface FaceDeviceIn { device_id: number; } // terminal camera selector
+export interface FaceVerifyIn { student_number: string; } // student to verify in a lecturer session
+export interface FaceStatus { enrolled: boolean; enrolled_at: string | null; } // current face enrollment state
+export interface FaceCommandOut extends CommandOut { // polled face command details
+  student_name: string | null;
+  threshold: number;
+  shots: number;
+  samples_captured: number;
+  preview_available: boolean;
+  frames_received: number;
+  face_score: number | null;
 }
 export interface StudentDetail extends StudentOut { courses: CourseBrief[]; fingerprint_slots: SlotOut[]; open_commands: CommandOut[]; } // GET /admin/students/{id}
 
